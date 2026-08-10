@@ -3,20 +3,20 @@ Liner Mesh Generator — addon de Blender.
 
 Flujo:
     1) Preparar escaneo    -> duplica el escaneo, lo pinta de gris y entra a
-                              Vertex Paint con brocha roja. Pinta la CRESTA.
-    2) Cortar por cresta   -> lee lo pintado, ajusta la curva de cresta,
-                              clasifica cada vertice arriba/abajo y crea un
-                              OBJETO NUEVO con el lado elegido.
-    3) Generar malla       -> reconstruye el liner a partir del objeto cortado.
+                              Vertex Paint con brocha roja. Pinta la REGION que
+                              quieres conservar (segmentacion binaria).
+    2) Segmentar (cortar)  -> binariza lo pintado: conserva lo pintado (o lo no
+                              pintado) y crea un OBJETO NUEVO con esa segmentacion.
+    3) Generar malla       -> reconstruye el liner a partir del objeto segmentado.
 """
 
 bl_info = {
     "name": "Liner Mesh Generator",
     "author": "Fernando Morales Magallón",
-    "version": (1, 1, 0),
-    "blender": (5, 2, 0),
+    "version": (1, 2, 0),
+    "blender": (5, 0, 0),
     "location": "View3D > Sidebar (N) > Liner",
-    "description": "Pinta la cresta, corta el escaneo y reconstruye el liner",
+    "description": "Pinta la region, segmenta el escaneo y reconstruye el liner",
     "category": "Mesh",
 }
 
@@ -30,8 +30,12 @@ from . import linergen
 
 PAINT_ATTR = "crest_paint"
 GRIS = (0.6, 0.6, 0.6, 1.0)
+ROJO = (1.0, 0.0, 0.0)
 
 
+# ----------------------------------------------------------------------
+# Utilidades Blender <-> numpy
+# ----------------------------------------------------------------------
 def puntos_de_objeto(obj):
     mw = np.array(obj.matrix_world)
     n = len(obj.data.vertices)
@@ -77,6 +81,7 @@ def _asegurar_atributo_pintura(mesh):
 
 
 def _leer_pintura(mesh):
+    """Devuelve (N,3) con el color RGB por vertice, o None si no hay capa."""
     attr = mesh.color_attributes.get(PAINT_ATTR)
     if attr is None or attr.domain != 'POINT':
         return None
@@ -86,60 +91,49 @@ def _leer_pintura(mesh):
     return cols.reshape(n, 4)[:, :3]
 
 
-def _crest_z_function(theta_c, z_c, n_bins=180):
-    bins = np.linspace(-np.pi, np.pi, n_bins + 1)
-    idx = np.clip(np.digitize(theta_c, bins) - 1, 0, n_bins - 1)
-    zmean = np.full(n_bins, np.nan)
-    for b in range(n_bins):
-        m = idx == b
-        if m.any():
-            zmean[b] = z_c[m].mean()
-    centers = 0.5 * (bins[:-1] + bins[1:])
-    valid = ~np.isnan(zmean)
-    tc, zc = centers[valid], zmean[valid]
-    text = np.concatenate([tc - 2*np.pi, tc, tc + 2*np.pi])
-    zext = np.tile(zc, 3)
-    return lambda q: np.interp(q, text, zext)
+def _mascara_pintada(mesh, tol):
+    """Segmentacion binaria: True en los vertices pintados de rojo."""
+    cols = _leer_pintura(mesh)
+    if cols is None:
+        return None
+    dist = np.linalg.norm(cols - np.array(ROJO), axis=1)
+    return dist < tol
 
 
-def clasificar_por_cresta(world_co, painted_mask, lado='ABAJO', tol=0.0):
-    ax = linergen._pca_main_axis(world_co)
-    R = linergen.rotation_matrix_from_vectors(ax, np.array([0, 0, 1.0]))
-    P = world_co @ R.T
-    cx, cy = P[:, 0].mean(), P[:, 1].mean()
-    Pc = P[painted_mask]
-    thc = np.arctan2(Pc[:, 1] - cy, Pc[:, 0] - cx)
-    f = _crest_z_function(thc, Pc[:, 2])
-    th = np.arctan2(P[:, 1] - cy, P[:, 0] - cx)
-    crest_z = f(th)
-    above = P[:, 2] > crest_z + tol
-    return (~above) if lado == 'ABAJO' else above
-
-
+# ----------------------------------------------------------------------
+# Propiedades
+# ----------------------------------------------------------------------
 class LinerProps(PropertyGroup):
+    # --- segmentacion ---
     lado: EnumProperty(
         name="Conservar",
-        description="Lado a conservar respecto a la cresta pintada",
-        items=[('ABAJO', "Abajo (cuerpo)", "Conserva lo que esta por debajo de la cresta"),
-               ('ARRIBA', "Arriba", "Conserva lo que esta por encima de la cresta")],
-        default='ABAJO')
+        description="Que parte conservar tras la segmentacion binaria",
+        items=[('PINTADO', "Lo pintado", "Conserva los vertices pintados"),
+               ('NO_PINTADO', "Lo no pintado", "Conserva los vertices SIN pintar")],
+        default='PINTADO')
     tol_rojo: FloatProperty(name="Tolerancia rojo", default=0.5, min=0.05, max=1.0,
-                            description="Que tan cerca del rojo puro cuenta como cresta")
-    tol_corte: FloatProperty(name="Margen de corte", default=0.0, min=-5.0, max=5.0,
-                             description="Desplaza el corte sobre/bajo la cresta")
+                            description="Que tan cerca del rojo puro cuenta como pintado")
+    solo_mayor_isla: BoolProperty(
+        name="Solo la isla mayor", default=False,
+        description="Tras segmentar, conserva unicamente el fragmento conectado mas grande")
+
+    # --- pipeline ---
     n_slices:   IntProperty(name="N slices", default=40, min=5, max=400)
     n_bins_env: IntProperty(name="N bins cresta", default=80, min=8, max=720)
     n_circ:     IntProperty(name="N puntos seccion", default=40, min=6, max=360)
     n_nodos:    IntProperty(name="Nodos seccion", default=10, min=2, max=60)
     suav_env:   FloatProperty(name="Suavizado cresta", default=1.0, min=0.0, max=50.0)
     sellar_base:     BoolProperty(name="Sellar base", default=True)
-    orient_esferico: BoolProperty(name="Extremo esferico abajo", default=False)
+    orient_esferico: BoolProperty(name="Extremo esferico abajo", default=True)
     rotacion_z:      BoolProperty(name="Rotacion Z (alinear minimo)", default=False)
 
 
+# ----------------------------------------------------------------------
+# Operadores
+# ----------------------------------------------------------------------
 class LINER_OT_prepare(Operator):
     bl_idname = "liner.prepare"
-    bl_label = "Preparar escaneo (pintar cresta)"
+    bl_label = "Preparar escaneo (pintar region)"
     bl_description = "Duplica el escaneo, lo pinta de gris y entra a Vertex Paint (brocha roja)"
 
     def execute(self, context):
@@ -166,18 +160,18 @@ class LINER_OT_prepare(Operator):
         bpy.ops.object.mode_set(mode='VERTEX_PAINT')
         ts = context.tool_settings
         try:
-            ts.vertex_paint.brush.color = (1.0, 0.0, 0.0)
-            ts.unified_paint_settings.color = (1.0, 0.0, 0.0)
+            ts.vertex_paint.brush.color = ROJO
+            ts.unified_paint_settings.color = ROJO
         except Exception:
             pass
-        self.report({'INFO'}, "Pinta la CRESTA de rojo. Luego 'Cortar por cresta'.")
+        self.report({'INFO'}, "Pinta de rojo la REGION a conservar. Luego 'Segmentar'.")
         return {'FINISHED'}
 
 
 class LINER_OT_cut(Operator):
     bl_idname = "liner.cut"
-    bl_label = "Cortar por cresta"
-    bl_description = "Corta el escaneo por la cresta pintada y crea un objeto nuevo"
+    bl_label = "Segmentar por pintura"
+    bl_description = "Binariza lo pintado y crea un objeto nuevo con la segmentacion"
 
     def execute(self, context):
         import bmesh
@@ -189,33 +183,33 @@ class LINER_OT_cut(Operator):
             bpy.ops.object.mode_set(mode='OBJECT')
 
         pr = context.scene.liner_props
-        cols = _leer_pintura(obj.data)
-        if cols is None:
+        painted = _mascara_pintada(obj.data, pr.tol_rojo)
+        if painted is None:
             self.report({'ERROR'}, "No hay capa de pintura. Usa 'Preparar escaneo' primero.")
             return {'CANCELLED'}
-
-        dist_rojo = np.linalg.norm(cols - np.array([1.0, 0.0, 0.0]), axis=1)
-        painted = dist_rojo < pr.tol_rojo
-        if painted.sum() < 8:
-            self.report({'ERROR'}, "Pocos vertices pintados (%d)." % int(painted.sum()))
+        if painted.sum() < 3:
+            self.report({'ERROR'}, "Casi nada pintado (%d vertices)." % int(painted.sum()))
             return {'CANCELLED'}
 
-        world = puntos_de_objeto(obj)
-        keep = clasificar_por_cresta(world, painted, lado=pr.lado, tol=pr.tol_corte)
-        if keep.sum() < 10 or (~keep).sum() < 1:
-            self.report({'ERROR'}, "El corte dejo un lado casi vacio. Revisa la cresta / el margen.")
+        keep = painted if pr.lado == 'PINTADO' else ~painted
+        if keep.sum() < 3 or (~keep).sum() < 1:
+            self.report({'ERROR'}, "La segmentacion dejo un lado vacio. Revisa la pintura.")
             return {'CANCELLED'}
 
+        # Segmentacion binaria: borrar los vertices NO conservados (arrastra sus caras)
         bm = bmesh.new()
         bm.from_mesh(obj.data)
         bm.verts.ensure_lookup_table()
         a_borrar = [v for v in bm.verts if not keep[v.index]]
         bmesh.ops.delete(bm, geom=a_borrar, context='VERTS')
 
-        new_mesh = bpy.data.meshes.new(obj.name + "_cut_mesh")
+        if pr.solo_mayor_isla:
+            self._quedar_isla_mayor(bm)
+
+        new_mesh = bpy.data.meshes.new(obj.name + "_seg_mesh")
         bm.to_mesh(new_mesh)
         bm.free()
-        new_obj = bpy.data.objects.new(obj.name.replace("_paint", "") + "_cut", new_mesh)
+        new_obj = bpy.data.objects.new(obj.name.replace("_paint", "") + "_seg", new_mesh)
         new_obj.matrix_world = obj.matrix_world
         context.collection.objects.link(new_obj)
 
@@ -223,8 +217,33 @@ class LINER_OT_cut(Operator):
             o.select_set(False)
         new_obj.select_set(True)
         context.view_layer.objects.active = new_obj
-        self.report({'INFO'}, "Corte listo (%d vertices). Ya puedes 'Generar malla'." % int(keep.sum()))
+        self.report({'INFO'}, "Segmentado: %d vertices. Ya puedes 'Generar malla'." % len(new_mesh.vertices))
         return {'FINISHED'}
+
+    @staticmethod
+    def _quedar_isla_mayor(bm):
+        """Conserva solo el fragmento conectado (isla) con mas vertices."""
+        restantes = set(bm.verts)
+        islas = []
+        visitados = set()
+        for v in bm.verts:
+            if v in visitados:
+                continue
+            pila, isla = [v], []
+            visitados.add(v)
+            while pila:
+                w = pila.pop()
+                isla.append(w)
+                for e in w.link_edges:
+                    o = e.other_vert(w)
+                    if o not in visitados:
+                        visitados.add(o); pila.append(o)
+            islas.append(isla)
+        if len(islas) <= 1:
+            return
+        islas.sort(key=len, reverse=True)
+        borrar = [v for isla in islas[1:] for v in isla]
+        bmesh.ops.delete(bm, geom=borrar, context='VERTS')
 
 
 class LINER_OT_install_scipy(Operator):
@@ -250,7 +269,7 @@ class LINER_OT_install_scipy(Operator):
 class LINER_OT_generate(Operator):
     bl_idname = "liner.generate"
     bl_label = "Generar malla del liner"
-    bl_description = "Reconstruye el liner a partir del objeto seleccionado (el cortado)"
+    bl_description = "Reconstruye el liner a partir del objeto seleccionado (el segmentado)"
 
     def execute(self, context):
         if not scipy_disponible():
@@ -258,7 +277,7 @@ class LINER_OT_generate(Operator):
             return {'CANCELLED'}
         obj = context.active_object
         if obj is None or obj.type != 'MESH':
-            self.report({'ERROR'}, "Selecciona el objeto cortado (malla).")
+            self.report({'ERROR'}, "Selecciona el objeto segmentado (malla).")
             return {'CANCELLED'}
         if obj.mode != 'OBJECT':
             bpy.ops.object.mode_set(mode='OBJECT')
@@ -307,6 +326,9 @@ class LINER_OT_generate(Operator):
         return {'FINISHED'}
 
 
+# ----------------------------------------------------------------------
+# Panel
+# ----------------------------------------------------------------------
 class LINER_PT_panel(Panel):
     bl_label = "Liner Mesh Generator"
     bl_idname = "LINER_PT_panel"
@@ -319,14 +341,14 @@ class LINER_PT_panel(Panel):
         pr = context.scene.liner_props
 
         box = layout.box()
-        box.label(text="1) Pintar la cresta", icon='BRUSH_DATA')
+        box.label(text="1) Pintar la region", icon='BRUSH_DATA')
         box.operator("liner.prepare", icon='GREASEPENCIL')
 
         box = layout.box()
-        box.label(text="2) Cortar por cresta", icon='MOD_BEVEL')
+        box.label(text="2) Segmentar por pintura", icon='MOD_MASK')
         box.prop(pr, "lado")
-        row = box.row(align=True)
-        row.prop(pr, "tol_rojo"); row.prop(pr, "tol_corte")
+        box.prop(pr, "tol_rojo")
+        box.prop(pr, "solo_mayor_isla")
         box.operator("liner.cut", icon='MOD_BOOLEAN')
 
         box = layout.box()
