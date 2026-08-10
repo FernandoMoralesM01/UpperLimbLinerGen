@@ -24,9 +24,9 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 import numpy as np
 
-from scipy.interpolate import UnivariateSpline, LSQUnivariateSpline, splprep, splev
-from scipy.signal import argrelextrema
-from scipy.optimize import differential_evolution
+# NOTA: SciPy se importa de forma perezosa dentro de cada método que lo usa,
+# para que este módulo se pueda importar (y usar sus utilidades numpy) aunque
+# SciPy no esté instalado (p. ej. al cargar el addon de Blender sin SciPy).
 
 
 # ======================================================================
@@ -64,7 +64,7 @@ class Config:
 
     # --- Orientación (opcional) ---
     APLICAR_ROTACION_Z: bool      = False  # girar en Z para alinear el mínimo con el centerline
-    ORIENT_SPHERICAL_DOWN: bool   = False  # poner el extremo más esférico abajo
+    ORIENT_SPHERICAL_DOWN: bool   = True   # orientar: extremo más esférico ABAJO (índice 0)
     FRAC_CASQUETE: float          = 0.15   # fracción del largo que cuenta como casquete de extremo
 
     def n_z1(self):
@@ -182,6 +182,8 @@ class Crest:
 
     # --- 1) cobertura angular por capas -> codo (dónde empieza la cresta) ---
     def coverage(self):
+        from scipy.interpolate import LSQUnivariateSpline
+        from scipy.optimize import differential_evolution
         cfg = self.p.cfg
         xy = self.p.xy_ordenado
         w = cfg.VENTANA_COBERTURA
@@ -225,6 +227,7 @@ class Crest:
 
     # --- 3) cresta suavizada: spline periódico ---
     def smooth(self):
+        from scipy.interpolate import splprep, splev
         cfg = self.p.cfg
         xe, ye, ze = self.env[:, 0], self.env[:, 1], self.env[:, 2]
         tck, _ = splprep([xe, ye, ze], s=len(xe) * cfg.SUAVIZADO_ENV, per=1)
@@ -262,6 +265,7 @@ class Crest:
 
     # --- 5) extremos (máximos/mínimos) de la cresta ---
     def extrema(self):
+        from scipy.signal import argrelextrema
         cfg = self.p.cfg
         d = np.diff(self.env_suave[:, :2], axis=0)
         s = np.concatenate([[0], np.cumsum(np.sqrt((d**2).sum(axis=1)))])
@@ -350,6 +354,7 @@ class Mesh:
     def resample_ring_spline(self, p, n_nodos=None):
         """Resamplea un anillo (x,y,z) en theta_grid con regresión de splines
         periódicos por coordenada (nodos internos fijos)."""
+        from scipy.interpolate import LSQUnivariateSpline
         cfg = self.p.cfg
         n_nodos = cfg.N_NODOS_SECCION if n_nodos is None else n_nodos
         tg = self.theta_grid
@@ -501,11 +506,14 @@ class LinerGen:
                 cl.append(self.puntos[mask].mean(axis=0))
         cl = np.array(cl)
         self.centerline_points = self._smooth_centerline(cl, cfg.SUAVIZADO_CL)
+        if cfg.ORIENT_SPHERICAL_DOWN:
+            self.orient_centerline_by_sphere()   # extremo más esférico -> índice 0 (abajo)
         print("Centerline:", self.centerline_points.shape)
         return self.centerline_points
 
     @staticmethod
     def _smooth_centerline(cl, s):
+        from scipy.interpolate import UnivariateSpline
         t = np.linspace(0, 1, len(cl))
         out = np.zeros_like(cl)
         for i in range(3):
@@ -516,12 +524,19 @@ class LinerGen:
     def compute_axis(self):
         cfg = self.cfg
         cl = self.centerline_points
-        t = np.arange(0, -cfg.N_PTS_REGRESION, -1, dtype=float)
-        slope, intercept = _fit_line(t, cl[-cfg.N_PTS_REGRESION:])
+        n = cfg.N_PTS_REGRESION
+        idx = np.arange(len(cl), dtype=float)
+        # ajustar la recta a los PRIMEROS N puntos (parte de ABAJO, junto al extremo esférico)
+        slope, intercept = _fit_line(idx[:n], cl[:n])
+        #slope, intercept = _fit_line(idx[n:], cl[n:])
+                
         self.direccion = slope / np.linalg.norm(slope)
-        t_fut = np.arange(0, -cl.shape[0], -1, dtype=float)
-        pp = t_fut[:, None] * slope[None, :] + intercept[None, :]
-        pp -= pp[-1] - cl[-1]                     # anclar al último punto
+        # el eje debe ir de ABAJO (índice 0, esférico) hacia ARRIBA (índice -1)
+        if np.dot(self.direccion, cl[-1] - cl[0]) < 0:
+            self.direccion = -self.direccion
+        # recta extrapolada, misma indexación que el centerline, ANCLADA ABAJO (índice 0)
+        pp = idx[:, None] * slope[None, :] + intercept[None, :]
+        pp += cl[0] - pp[0]                        # anclar al extremo inferior (comienzo)
         self.puntos_predichos = pp
         self.error = pp - cl
         print("Dirección:", self.direccion)
@@ -533,8 +548,6 @@ class LinerGen:
         self.puntos_rot = self.puntos @ self.R.T
         self.centerline_rot = self.centerline_points @ self.R.T
         self.puntos_predichos_rot = self.puntos_predichos @ self.R.T
-        if self.cfg.ORIENT_SPHERICAL_DOWN:
-            self.orient_spherical_down()
         return self.puntos_rot
 
     # --- 5) ordenar por Z descendente ---
@@ -569,21 +582,46 @@ class LinerGen:
         print("Más esférico:", info["mas_esferico"])
         return info
 
-    def orient_spherical_down(self):
-        """Voltea 180° (si hace falta) para que el extremo más esférico quede
-        en la parte baja (menor z). Rotación propia sobre el eje X."""
-        info = self.end_sphericity()
-        z_esf = info[info["mas_esferico"]]["z"]
-        z_otro = info["B" if info["mas_esferico"] == "A" else "A"]["z"]
-        if z_esf > z_otro:                        # el esférico está arriba -> voltear
-            flip = np.diag([1.0, -1.0, -1.0])     # 180° sobre X (det +1)
-            self.puntos_rot = self.puntos_rot @ flip.T
-            self.centerline_rot = self.centerline_rot @ flip.T
-            self.puntos_predichos_rot = self.puntos_predichos_rot @ flip.T
-            print("Figura volteada: extremo más esférico abajo.")
+    def orient_centerline_by_sphere(self):
+        """Al terminar el centerline, mide en CADA extremo qué tan bien los puntos
+        del casquete forman una esfera de radio ~constante alrededor del punto
+        extremo del centerline (radio = distancia centerline->puntos del casquete).
+        El extremo más esférico (menor variación relativa del radio) se coloca en
+        el índice 0 (ABAJO), de modo que el eje vaya de abajo (esférico) hacia arriba.
+        """
+        cl = self.centerline_points
+        A, B = cl[0], cl[-1]
+        u = B - A
+        L = np.linalg.norm(u)
+        u = u / L
+        proj = (self.puntos - A) @ u                 # 0 en A, L en B
+        f = self.cfg.FRAC_CASQUETE
+        capa_A = self.puntos[proj < f * L]
+        capa_B = self.puntos[proj > (1 - f) * L]
+
+        def esfericidad(cap, centro):
+            # radio = distancia del punto extremo del centerline a los puntos del casquete
+            r = np.linalg.norm(cap - centro, axis=1)
+            radio_prom = float(r.mean()) if len(r) else np.inf
+            cv = float(r.std() / r.mean()) if len(r) and r.mean() > 0 else np.inf
+            return radio_prom, cv                    # cv menor = más esférico
+
+        rA, cvA = esfericidad(capa_A, A)
+        rB, cvB = esfericidad(capa_B, B)
+        self.sphere_info = {
+            "A": {"radio_prom": rA, "cv": cvA, "n": len(capa_A)},
+            "B": {"radio_prom": rB, "cv": cvB, "n": len(capa_B)},
+            "mas_esferico": "A" if cvA <= cvB else "B",
+        }
+        print(f"Extremo A: radio_prom={rA:.2f}  cv={cvA:.4f}  (n={len(capa_A)})")
+        print(f"Extremo B: radio_prom={rB:.2f}  cv={cvB:.4f}  (n={len(capa_B)})")
+
+        if cvB < cvA:                                # B es más esférico -> pásalo a índice 0
+            self.centerline_points = cl[::-1]
+            print("Centerline invertido: extremo B (más esférico) queda ABAJO.")
         else:
-            print("El extremo más esférico ya estaba abajo.")
-        return self.puntos_rot
+            print("Extremo A (más esférico) queda ABAJO.")
+        return self.sphere_info
 
     def align_min_z(self):
         """Gira en Z para que la línea mínimo->centerline caiga sobre el eje X.
