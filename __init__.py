@@ -30,7 +30,7 @@ from . import linergen
 
 PAINT_ATTR = "crest_paint"
 GRIS = (0.6, 0.6, 0.6, 1.0)
-ROJO = (0.0, 0.0, 0.0)
+ROJO = (1.0, 0.0, 0.0)
 
 
 # ----------------------------------------------------------------------
@@ -116,17 +116,25 @@ class LinerProps(PropertyGroup):
     solo_mayor_isla: BoolProperty(
         name="Solo la isla mayor", default=False,
         description="Tras segmentar, conserva unicamente el fragmento conectado mas grande")
-
+ 
     # --- pipeline ---
-    n_slices:   IntProperty(name="N slices", default=40, min=5, max=400)
-    n_bins_env: IntProperty(name="N bins cresta", default=80, min=8, max=720)
-    n_circ:     IntProperty(name="N puntos seccion", default=40, min=6, max=360)
-    n_nodos:    IntProperty(name="Nodos seccion", default=10, min=2, max=60)
-    suav_env:   FloatProperty(name="Suavizado cresta", default=1.0, min=0.0, max=50.0)
+    n_slices:   IntProperty(name="# segmentos verticales", default=30, min=5, max=400)
+    n_pts_reg:  IntProperty(name="# puntos extrapolación", default=3, min=1, max=10)
+
+    n_bins_env: IntProperty(name="# puntos de la cresta", default=180, min=8, max=720)
+    #n_env_fino: IntProperty(name="factor de suavizado cresta", default=500, min=100, max=2000)
+
+    orden_k: IntProperty(name="orden polinomial", default=5, min=1, max=20)
+    n_circ:     IntProperty(name="# puntos en cada segmento", default=40, min=6, max=360)
+    n_nodos:    IntProperty(name="# nodos splines", default=10, min=2, max=60)
+    suav_env:   FloatProperty(name="factor de suavizado cresta", default=1.0, min=0.0, max=50.0)
+    #n_z1:       FloatProperty(name="# anillos parte inferior", default=None, min=5.0, max=1000.0)
+    #n_z2:       FloatProperty(name="# anillos parte superior", default=None, min=2.0, max=1000.0)
+
     sellar_base:     BoolProperty(name="Sellar base", default=True)
     orient_esferico: BoolProperty(name="Extremo esferico abajo", default=True)
     rotacion_z:      BoolProperty(name="Rotacion Z (alinear minimo)", default=False)
-
+    frac_casquete: FloatProperty(name="Fracción del largo casquete", default=0.3, min=0.1, max=0.8)
 
 # ----------------------------------------------------------------------
 # Operadores
@@ -290,7 +298,9 @@ class LINER_OT_generate(Operator):
 
         cfg = linergen.Config(
             N_SLICES=pr.n_slices, N_BINS_ENV=pr.n_bins_env, N_CIRC=pr.n_circ,
+            N_PTS_REGRESION=pr.n_pts_reg, ORDEN_K=pr.orden_k,  
             N_NODOS_SECCION=pr.n_nodos, SUAVIZADO_ENV=pr.suav_env,
+            FRAC_CASQUETE=pr.frac_casquete,
             SELLAR_BASE=pr.sellar_base, ORIENT_SPHERICAL_DOWN=pr.orient_esferico,
             APLICAR_ROTACION_Z=pr.rotacion_z, IFSHOW=False,
         )
@@ -359,7 +369,11 @@ class LINER_PT_panel(Panel):
             b.operator("liner.install_scipy", icon='CONSOLE')
         col = box.column(align=True)
         col.prop(pr, "n_slices"); col.prop(pr, "n_bins_env")
+        col.prop(pr, "n_pts_reg"); col.prop(pr, "orden_k")
+                  
         col.prop(pr, "n_circ"); col.prop(pr, "n_nodos"); col.prop(pr, "suav_env")
+        col.prop(pr, "frac_casquete")
+        
         col = box.column(align=True)
         col.prop(pr, "sellar_base"); col.prop(pr, "orient_esferico"); col.prop(pr, "rotacion_z")
         box.operator("liner.generate", icon='MESH_CYLINDER')
