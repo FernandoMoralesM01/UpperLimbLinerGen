@@ -65,7 +65,7 @@ class Config:
     # --- Orientación (opcional) ---
     APLICAR_ROTACION_Z: bool      = False  # girar en Z para alinear el mínimo con el centerline
     ORIENT_SPHERICAL_DOWN: bool   = True   # orientar: extremo más esférico ABAJO (índice 0)
-    FRAC_CASQUETE: float          = 0.15   # fracción del largo que cuenta como casquete de extremo
+    FRAC_CASQUETE: float          = 0.50   # fracción del largo que cuenta como casquete de extremo
 
     def n_z1(self):
         return self.N_SLICES if self.N_Z1 is None else self.N_Z1
