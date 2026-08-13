@@ -80,6 +80,7 @@ class Config:
 def _pca_main_axis(X):
     """Primer componente principal (numpy, sin sklearn)."""
     Xc = X - X.mean(axis=0)
+    print("mean", X.mean(axis=0), "std", X.std(axis=0))
     _, _, Vt = np.linalg.svd(Xc, full_matrices=False)
     return Vt[0]
 
@@ -497,6 +498,7 @@ class LinerGen:
         cfg = self.cfg
         main_axis = _pca_main_axis(self.puntos)
         proj = (self.puntos - self.puntos.mean(axis=0)) @ main_axis
+        print(print("mean pr", proj.mean(axis=0), "std pr", proj.std(axis=0)))
         bins = np.linspace(proj.min() + cfg.CL_OFFSET_MIN,
                            proj.max() - cfg.CL_OFFSET_MAX, cfg.N_SLICES)
         cl = []
@@ -520,25 +522,104 @@ class LinerGen:
             out[:, i] = UnivariateSpline(t, cl[:, i], s=s)(t)
         return out
 
+    @staticmethod
+    def _ajuste_domo(P, punta, inward_unit, L, frac):
+        """Ajusta el domo (media esfera) del casquete junto a 'punta'.
+        'inward_unit' apunta de la punta hacia el cuerpo. Reajusta usando solo los
+        puntos sobre la cáscara esférica (descarta el tubo).
+        Devuelve (centro, radio, eje_afuera, error)."""
+        P = np.asarray(P, float)
+        proj = (P - punta) @ inward_unit                 # 0 en la punta, crece hacia el cuerpo
+        print("Frac:", frac * L)
+        cap = P[(proj >= 0) & (proj < frac * L)]
+        if len(cap) < 8:
+            return None, np.inf, inward_unit, np.inf
+        C0, R0, _ = ajustar_esfera(cap)
+        d0 = np.linalg.norm(cap - C0, axis=1)
+        dome = cap[np.abs(d0 - R0) < 0.3 * R0]           # solo la cáscara (sin tubo)
+        if len(dome) < 20:
+            dome = cap
+        C, R, err = ajustar_esfera(dome)
+        eje = (dome - C).mean(axis=0)                    # del centro hacia el domo (afuera)
+        eje /= np.linalg.norm(eje)
+        if eje @ inward_unit > 0:                        # forzar que 'afuera' sea opuesto a 'inward'
+            eje = -eje
+        return C, R, eje, err
+
+    def _semiesfera_extremo(self, cl, punta_idx, dir_idx):
+        """Ajusta la semiesfera de un extremo del centerline con TU especificación:
+        - eje/dirección = vector del centerline hacia afuera en esa punta
+            (de cl[dir_idx] hacia cl[punta_idx]).
+        - radio = distancia del punto extremo del centerline al casquete medida
+            PERPENDICULAR al eje (radio de la sección en ese extremo).
+        - centro = punta - R*a  (la semiesfera 'apunta' según el segmento tomado).
+        Devuelve (radio, error_rel): error_rel menor = mejor semiesfera.
+        """
+        P = self.puntos
+        punta = cl[punta_idx]
+        a = punta - cl[dir_idx]                     # dirección hacia afuera (según el segmento)
+        a = a / np.linalg.norm(a)
+
+        # casquete de ese extremo: puntos del lado de la punta
+        proj = (P - punta) @ a                      # >0 = hacia afuera de la punta
+        L = np.linalg.norm(cl[-1] - cl[0])
+        cap = P[proj > -self.cfg.FRAC_CASQUETE * L]  # el casquete del lado de la punta
+        if len(cap) < 8:
+            return np.inf, np.inf
+
+        # radio = distancia perpendicular al eje (radio de la sección en el extremo)
+        q = cap - punta
+        perp = q - np.outer(q @ a, a)               # componente perpendicular al eje
+        R = float(np.linalg.norm(perp, axis=1).mean())   # radio de la esfera = radio perpendicular
+
+        # centro de la semiesfera según la dirección del segmento
+        C = punta - R * a
+        d = np.linalg.norm(cap - C, axis=1)
+        err = float(np.sqrt(np.mean((d - R) ** 2)) / R)
+        return R, err
     # --- 3) eje recto por regresión (extrapolación) ---
     def compute_axis(self):
         cfg = self.cfg
         cl = self.centerline_points
         n = cfg.N_PTS_REGRESION
         idx = np.arange(len(cl), dtype=float)
-        # ajustar la recta a los PRIMEROS N puntos (parte de ABAJO, junto al extremo esférico)
-        slope, intercept = _fit_line(idx[:n], cl[:n])
-        #slope, intercept = _fit_line(idx[n:], cl[n:])
-                
+
+        k = min(cfg.N_PTS_REGRESION, len(cl) - 1)
+        R_ini, err_ini = self._semiesfera_extremo(cl, punta_idx=0,  dir_idx=k)        # extremo inicio
+        R_fin, err_fin = self._semiesfera_extremo(cl, punta_idx=-1, dir_idx=-1 - k)   # extremo final
+        # --- 1. Identificar el extremo esférico (abajo) con dos semiesferas ---
+        # dirección de cada punta según el segmento del centerline en ese extremo
+        extremo_es_inicio = err_ini <= err_fin      # menor error = mejor semiesfera = abajo
+        print(f"Semiesfera inicio: R={R_ini:.2f} err={err_ini:.4f} | "
+            f"final: R={R_fin:.2f} err={err_fin:.4f} "
+            f"-> abajo = {'inicio (0)' if extremo_es_inicio else 'final (-1)'}")
+        
+        # --- 2. Ajustar la recta a los N puntos del lado donde está el casquete ---
+        if extremo_es_inicio:
+            idx_fit = idx[:n]
+            cl_fit = cl[:n]
+            punto_ancla = cl[0]
+        else:
+            idx_fit = idx[-n:]
+            cl_fit = cl[-n:]
+            punto_ancla = cl[-1]
+
+        slope, intercept = _fit_line(idx_fit, cl_fit)
+
         self.direccion = slope / np.linalg.norm(slope)
-        # el eje debe ir de ABAJO (índice 0, esférico) hacia ARRIBA (índice -1)
-        if np.dot(self.direccion, cl[-1] - cl[0]) < 0:
+        # el eje debe ir de ABAJO (extremo esférico) hacia ARRIBA (el otro extremo)
+        destino = cl[-1] if extremo_es_inicio else cl[0]
+        if np.dot(self.direccion, destino - punto_ancla) < 0:
             self.direccion = -self.direccion
-        # recta extrapolada, misma indexación que el centerline, ANCLADA ABAJO (índice 0)
+
+        # --- 3. Recta extrapolada, misma indexación que el centerline, anclada en el extremo esférico ---
         pp = idx[:, None] * slope[None, :] + intercept[None, :]
-        pp += cl[0] - pp[0]                        # anclar al extremo inferior (comienzo)
+        pp += punto_ancla - (pp[0] if extremo_es_inicio else pp[-1])
+
         self.puntos_predichos = pp
         self.error = pp - cl
+        self.extremo_esferico_idx = 0 if extremo_es_inicio else -1  # guardado por si lo necesitas después
+
         print("Dirección:", self.direccion)
         return self.direccion
 
@@ -570,6 +651,7 @@ class LinerGen:
         eje = B - A; L = np.linalg.norm(eje); eje = eje / L
         proj = (pr - A) @ eje
         f = self.cfg.FRAC_CASQUETE
+        print("Casquete: ", f * L, f, L)
         capa_A = pr[proj < f * L]
         capa_B = pr[proj > (1 - f) * L]
         cenA, rA, eA = ajustar_esfera(capa_A)
@@ -583,44 +665,19 @@ class LinerGen:
         return info
 
     def orient_centerline_by_sphere(self):
-        """Al terminar el centerline, mide en CADA extremo qué tan bien los puntos
-        del casquete forman una esfera de radio ~constante alrededor del punto
-        extremo del centerline (radio = distancia centerline->puntos del casquete).
-        El extremo más esférico (menor variación relativa del radio) se coloca en
-        el índice 0 (ABAJO), de modo que el eje vaya de abajo (esférico) hacia arriba.
-        """
+        """Coloca el extremo más esférico (mejor domo) en el índice 0 (abajo)."""
         cl = self.centerline_points
         A, B = cl[0], cl[-1]
-        u = B - A
-        L = np.linalg.norm(u)
-        u = u / L
-        proj = (self.puntos - A) @ u                 # 0 en A, L en B
-        f = self.cfg.FRAC_CASQUETE
-        capa_A = self.puntos[proj < f * L]
-        capa_B = self.puntos[proj > (1 - f) * L]
-
-        def esfericidad(cap, centro):
-            # radio = distancia del punto extremo del centerline a los puntos del casquete
-            r = np.linalg.norm(cap - centro, axis=1)
-            radio_prom = float(r.mean()) if len(r) else np.inf
-            cv = float(r.std() / r.mean()) if len(r) and r.mean() > 0 else np.inf
-            return radio_prom, cv                    # cv menor = más esférico
-
-        rA, cvA = esfericidad(capa_A, A)
-        rB, cvB = esfericidad(capa_B, B)
-        self.sphere_info = {
-            "A": {"radio_prom": rA, "cv": cvA, "n": len(capa_A)},
-            "B": {"radio_prom": rB, "cv": cvB, "n": len(capa_B)},
-            "mas_esferico": "A" if cvA <= cvB else "B",
-        }
-        print(f"Extremo A: radio_prom={rA:.2f}  cv={cvA:.4f}  (n={len(capa_A)})")
-        print(f"Extremo B: radio_prom={rB:.2f}  cv={cvB:.4f}  (n={len(capa_B)})")
-
-        if cvB < cvA:                                # B es más esférico -> pásalo a índice 0
+        L = np.linalg.norm(B - A)
+        uAB = (B - A) / L
+        _, rA, _, eA = self._ajuste_domo(self.puntos, A,  uAB, L, self.cfg.FRAC_CASQUETE)
+        _, rB, _, eB = self._ajuste_domo(self.puntos, B, -uAB, L, self.cfg.FRAC_CASQUETE)
+        self.sphere_info = {"A": {"radio": rA, "err": eA}, "B": {"radio": rB, "err": eB},
+                            "mas_esferico": "A" if eA <= eB else "B"}
+        print(f"Extremo A: R={rA:.2f} err={eA:.4f} | Extremo B: R={rB:.2f} err={eB:.4f}")
+        if eB < eA:
             self.centerline_points = cl[::-1]
             print("Centerline invertido: extremo B (más esférico) queda ABAJO.")
-        else:
-            print("Extremo A (más esférico) queda ABAJO.")
         return self.sphere_info
 
     def align_min_z(self):
