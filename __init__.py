@@ -29,8 +29,8 @@ from bpy.types import Operator, Panel, PropertyGroup
 from . import linergen
 
 PAINT_ATTR = "crest_paint"
-GRIS = (0.6, 0.6, 0.6, 1.0)
-ROJO = (1.0, 0.0, 0.0)
+GRIS = (0.7, 0.7, 0.7, 0.7)
+ROJO = (0.0, 0.0, 0.0)
 
 
 # ----------------------------------------------------------------------
