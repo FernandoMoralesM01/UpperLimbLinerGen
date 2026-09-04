@@ -209,6 +209,13 @@ class RetopologiaProps(PropertyGroup):
         description="Franja de arriba del tubo que ocupa Z2. El resto es Z1")
     nodos_z1: IntProperty(name="Nodos spline Z1", default=6, min=1, max=30)
     nodos_z2: IntProperty(name="Nodos spline Z2", default=4, min=1, max=30)
+    margen_cresta: FloatProperty(
+        name="Margen bajo la cresta", default=0.10, min=0.0, max=0.5,
+        description="Altura que se reserva bajo el punto mas bajo de la cresta "
+                    "para la banda Z3. Si los anillos se encinan en la cresta, subelo")
+    tension_cresta: FloatProperty(
+        name="Tensión al llegar a la cresta", default=1.0, min=0.0, max=2.0,
+        description="Curvatura del spline de Z3 al aterrizar sobre la cresta")
     zonas_avanzado: BoolProperty(name="Ajustes avanzados de zonas", default=False)
 
     # --- casquete inferior ---
@@ -591,6 +598,7 @@ class RETOPOLOGIA_OT_generate(Operator):
             FRAC_CASQUETE=pr.frac_casquete,
             N_Z1=pr.n_z1, N_Z2=pr.n_z2, N_Z3=pr.n_z3,
             FRAC_Z2=pr.frac_z2, NODOS_Z1=pr.nodos_z1, NODOS_Z2=pr.nodos_z2,
+            MARGEN_CRESTA=pr.margen_cresta, TENSION_CRESTA=pr.tension_cresta,
             N_CAP=pr.n_cap, FRAC_CAP_Z=pr.frac_cap_z,
             PUNTO_BASE=_obtener_punto_base(context),
             USAR_BASE_ORIENTACION=pr.usar_base_orient,
@@ -703,11 +711,13 @@ class RETOPOLOGIA_PT_panel(Panel):
         zb.prop(pr, "frac_z2", slider=True)
         zb.label(text="Z2 se lleva el %d%% de arriba del tubo; Z1 el resto"
                       % int(round(pr.frac_z2 * 100)))
+        zb.prop(pr, "margen_cresta", slider=True)
         zb.prop(pr, "zonas_avanzado", toggle=True)
         if pr.zonas_avanzado:
             col = zb.column(align=True)
             col.prop(pr, "nodos_z1")
             col.prop(pr, "nodos_z2")
+            col.prop(pr, "tension_cresta")
 
         # ---- casquete inferior ----
         cb = box.box()
