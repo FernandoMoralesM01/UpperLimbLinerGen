@@ -55,9 +55,23 @@ class Config:
     ORDEN_K: int         = 10      # grado de los splines de regresión (se limita a 3 donde aplica)
     N_CIRC: int          = 40      # puntos por sección transversal
     N_NODOS_SECCION: int = 10      # nodos internos del spline por sección
-    N_Z1: int | None     = None    # anillos en la Parte 1 (None -> N_SLICES)
-    N_Z2: int | None     = None    # filas en la Parte 2 (None -> max(4, N_SLICES//3))
+
+    # --- Zonas longitudinales (TRES splines en Z) ---
+    # Z1: casquete inferior   Z2: cuerpo   Z3: transición a la cresta
+    N_Z1: int | None     = 12      # anillos en Z1 (None -> N_SLICES)
+    N_Z2: int | None     = 18      # anillos en Z2 (None -> max(4, N_SLICES//3))
+    N_Z3: int | None     = 10      # anillos en Z3 (None -> max(4, N_SLICES//3))
+    FRAC_Z1: float       = 0.30    # fracción de (z_crest_start - z_bottom) que ocupa Z1
+    NODOS_Z1: int        = 4       # nodos internos del spline en Z de la zona 1
+    NODOS_Z2: int        = 6       # nodos internos del spline en Z de la zona 2
+    N_MUESTRAS_Z: int | None = None  # anillos medidos por rebanado (None -> auto)
+
     SELLAR_BASE: bool    = True    # cerrar la base con un ápice en el punto mínimo
+
+    # --- Punto base (extremo inferior del muñón, elegido por el usuario) ---
+    PUNTO_BASE: object = None            # np.array (3,) en el mismo espacio que 'puntos'
+    USAR_BASE_ORIENTACION: bool = True   # el punto base decide qué extremo va abajo
+    USAR_BASE_APICE: bool = True         # el ápice de la base se sella en ese punto
 
     # --- Visualización ---
     IFSHOW: bool = True            # por defecto, ¿mostrar las gráficas? (se puede sobre-escribir por llamada)
@@ -68,10 +82,23 @@ class Config:
     FRAC_CASQUETE: float          = 0.50   # fracción del largo que cuenta como casquete de extremo
 
     def n_z1(self):
-        return self.N_SLICES if self.N_Z1 is None else self.N_Z1
+        return self.N_SLICES if self.N_Z1 is None else max(2, int(self.N_Z1))
 
     def n_z2(self):
-        return max(4, self.N_SLICES // 3) if self.N_Z2 is None else self.N_Z2
+        if self.N_Z2 is None:
+            return max(4, self.N_SLICES // 3)
+        return max(2, int(self.N_Z2))
+
+    def n_z3(self):
+        if self.N_Z3 is None:
+            return max(4, self.N_SLICES // 3)
+        return max(1, int(self.N_Z3))
+
+    def punto_base(self):
+        """Punto base como np.array(3,), o None si no se definió."""
+        if self.PUNTO_BASE is None:
+            return None
+        return np.asarray(self.PUNTO_BASE, float).reshape(3)
 
 
 # ======================================================================
@@ -375,42 +402,124 @@ class Mesh:
             out[:, k] = spl(tg)
         return out
 
-    # --- Parte 1: anillos cerrados de la base al inicio de la cresta ---
-    def _part1(self):
+    # --- medición: anillos reales obtenidos rebanando la nube ---
+    def _medir_anillos(self, z_lo, z_hi, n_muestras):
+        """Rebana la nube entre z_lo y z_hi y devuelve (anillos, z_medio)."""
         cfg = self.p.cfg
         pr = self.p.puntos_rot
-        env_suave = self.p.crest.env_suave
-        z_bottom = np.percentile(pr[:, 2], 1)
-        z_crest_start = env_suave[:, 2].min()
-        self.z_bottom, self.z_crest_start = z_bottom, z_crest_start
-        self.z_crest_top = env_suave[:, 2].max()
-        print(f"z_bottom={z_bottom:.2f}  z_crest_start={z_crest_start:.2f}  "
-              f"z_crest_top={self.z_crest_top:.2f}")
-
-        n_z1 = cfg.n_z1()
-        z_levels = np.linspace(z_bottom, z_crest_start, n_z1)
-        espesor = (z_crest_start - z_bottom) / n_z1 * 1.5
-        rows = []
+        z_levels = np.linspace(z_lo, z_hi, max(2, int(n_muestras)))
+        espesor = (z_hi - z_lo) / max(1, len(z_levels)) * 1.5
+        rows, zs = [], []
         for zc in z_levels:
             slab = pr[np.abs(pr[:, 2] - zc) < espesor]
             if len(slab) < cfg.N_NODOS_SECCION + 4:
                 continue
-            rows.append(self.resample_ring_spline(slab))
-        self.rows1 = np.array(rows)
-        if len(self.rows1) < 2:
-            raise ValueError("Parte 1 sin suficientes anillos. Sube 'espesor' o baja N_Z1.")
-        print("Parte 1:", self.rows1.shape)
+            anillo = self.resample_ring_spline(slab)
+            rows.append(anillo)
+            zs.append(float(anillo[:, 2].mean()))
+        if not rows:
+            return np.empty((0, cfg.N_CIRC, 3)), np.empty(0)
+        rows = np.array(rows)
+        zs = np.array(zs)
+        o = np.argsort(zs)
+        return rows[o], zs[o]
 
-    # --- Parte 2: transición alineada a la cresta ---
+    @staticmethod
+    def _spline_z(rows, zs, z_out, n_nodos, orden=3):
+        """Spline de regresión EN Z, uno por columna angular y coordenada.
+
+        rows: (m, N_CIRC, 3) anillos medidos    zs: (m,) altura de cada anillo
+        z_out: alturas donde se quiere evaluar. Devuelve (len(z_out), N_CIRC, 3).
+        """
+        from scipy.interpolate import LSQUnivariateSpline
+        zs_u, iu = np.unique(zs, return_index=True)
+        rows = rows[iu]
+        n_col = rows.shape[1]
+        out = np.empty((len(z_out), n_col, 3))
+
+        # nunca extrapolamos: fuera del rango medido el spline se dispara
+        z_ev = np.clip(np.asarray(z_out, float), zs_u[0], zs_u[-1])
+
+        k = int(min(orden, max(1, len(zs_u) - 1)))
+        if len(zs_u) < k + 2:                       # muy pocos anillos -> lineal
+            for j in range(n_col):
+                for c in range(3):
+                    out[:, j, c] = np.interp(z_ev, zs_u, rows[:, j, c])
+            return out
+
+        n_nod = int(min(max(1, n_nodos), max(1, len(zs_u) // 3)))
+        nodos = np.linspace(zs_u[0], zs_u[-1], n_nod + 2)[1:-1]
+        for j in range(n_col):
+            for c in range(3):
+                spl = LSQUnivariateSpline(zs_u, rows[:, j, c], nodos, k=k)
+                out[:, j, c] = spl(z_ev)
+        return out
+
+    # --- Zonas 1 y 2: casquete inferior y cuerpo, un spline en Z cada una ---
+    def _part1(self):
+        cfg = self.p.cfg
+        pr = self.p.puntos_rot
+        env_suave = self.p.crest.env_suave
+
+        # La base la fija el usuario si eligió el punto de hasta abajo del muñón.
+        pb = getattr(self.p, "punto_base_rot", None)
+        if pb is not None and cfg.USAR_BASE_APICE:
+            z_bottom = float(pb[2])
+            print("z_bottom tomado del punto base elegido por el usuario.")
+        else:
+            z_bottom = float(np.percentile(pr[:, 2], 1))
+
+        z_crest_start = float(env_suave[:, 2].min())
+        self.z_bottom, self.z_crest_start = z_bottom, z_crest_start
+        self.z_crest_top = float(env_suave[:, 2].max())
+        print(f"z_bottom={z_bottom:.2f}  z_crest_start={z_crest_start:.2f}  "
+              f"z_crest_top={self.z_crest_top:.2f}")
+
+        n_z1, n_z2 = cfg.n_z1(), cfg.n_z2()
+        frac = float(np.clip(cfg.FRAC_Z1, 0.05, 0.95))
+        z_split = z_bottom + frac * (z_crest_start - z_bottom)
+        self.z_split = z_split
+
+        # Se mide una sola vez toda la zona tubular; luego cada zona ajusta su
+        # propio spline sobre los anillos que le tocan.
+        n_muestras = cfg.N_MUESTRAS_Z or max(cfg.N_SLICES, n_z1 + n_z2)
+        rows_m, zs_m = self._medir_anillos(z_bottom, z_crest_start, n_muestras)
+        if len(rows_m) < 4:
+            raise ValueError(
+                "Muy pocos anillos medidos (%d). Baja '# nodos splines' o revisa "
+                "la segmentacion." % len(rows_m))
+
+        # Cada zona toma sus anillos y dos vecinos de la otra, para que los dos
+        # splines lleguen a la frontera con casi la misma pendiente.
+        i_split = int(np.searchsorted(zs_m, z_split))
+        sel1 = slice(0, min(len(zs_m), max(4, i_split + 2)))
+        sel2 = slice(max(0, min(i_split - 2, len(zs_m) - 4)), len(zs_m))
+
+        niv1 = np.linspace(z_bottom, z_split, n_z1 + 1)
+        niv2 = np.linspace(z_split, z_crest_start, n_z2 + 1)
+
+        r1 = self._spline_z(rows_m[sel1], zs_m[sel1], niv1, cfg.NODOS_Z1)
+        r2 = self._spline_z(rows_m[sel2], zs_m[sel2], niv2, cfg.NODOS_Z2)
+
+        # El anillo de la frontera se comparte: promedio de los dos splines, asi
+        # Z1 y Z2 se unen sin escalon.
+        frontera = 0.5 * (r1[-1] + r2[0])
+        self.rows_z1, self.rows_z2 = r1[:-1], r2[1:]
+        self.rows1 = np.vstack([r1[:-1], frontera[None, :, :], r2[1:]])
+        print(f"Zona 1: {self.rows_z1.shape} | Zona 2: {self.rows_z2.shape} "
+              f"| z_split={z_split:.2f} | anillos medidos={len(rows_m)}")
+
+    # --- Zona 3: transición alineada a la cresta ---
     def _part2(self):
         cfg = self.p.cfg
         env_suave = self.p.crest.env_suave
         crest_cols = self.resample_ring_spline(env_suave[:, :3])
         last_ring = self.rows1[-1]
-        f_lin = np.linspace(0, 1, cfg.n_z2() + 1)[1:]
+        f_lin = np.linspace(0, 1, cfg.n_z3() + 1)[1:]
         fs = f_lin * f_lin * (3 - 2 * f_lin)          # smoothstep
         self.rows2 = np.array([(1 - f) * last_ring + f * crest_cols for f in fs])
-        print("Parte 2:", self.rows2.shape,
+        self.rows_z3 = self.rows2
+        print("Zona 3:", self.rows2.shape,
               "| borde superior = cresta:", np.allclose(self.rows2[-1], crest_cols))
 
     # --- ensamblar malla + caras ---
@@ -428,7 +537,11 @@ class Mesh:
     def seal_base(self):
         cfg = self.p.cfg
         pr = self.p.puntos_rot
-        apice = pr[np.argmin(pr[:, 2])]
+        pb = getattr(self.p, "punto_base_rot", None)
+        if pb is not None and cfg.USAR_BASE_APICE:
+            apice = np.asarray(pb, float)[:3]
+        else:
+            apice = pr[np.argmin(pr[:, 2])][:3]
         idx_apice = len(self.vertices)
         self.vertices = np.vstack([self.vertices, apice])
         tapa = [[idx_apice, j, (j + 1) % cfg.N_CIRC] for j in range(cfg.N_CIRC)]
@@ -480,6 +593,7 @@ class LinerGen:
     def __init__(self, cfg: Config | None = None, puntos: np.ndarray | None = None):
         self.cfg = cfg or Config()
         self.puntos = None if puntos is None else np.asarray(puntos, float)
+        self.punto_base_rot = None      # punto base en el marco alineado con Z
         self.crest = Crest(self)
         self.mesh = Mesh(self)
 
@@ -508,7 +622,12 @@ class LinerGen:
                 cl.append(self.puntos[mask].mean(axis=0))
         cl = np.array(cl)
         self.centerline_points = self._smooth_centerline(cl, cfg.SUAVIZADO_CL)
-        if cfg.ORIENT_SPHERICAL_DOWN:
+
+        # El punto base elegido por el usuario manda sobre la heurística de las
+        # semiesferas: es un dato, no una estimación.
+        if cfg.punto_base() is not None and cfg.USAR_BASE_ORIENTACION:
+            self.orient_centerline_by_base()
+        elif cfg.ORIENT_SPHERICAL_DOWN:
             self.orient_centerline_by_sphere()   # extremo más esférico -> índice 0 (abajo)
         print("Centerline:", self.centerline_points.shape)
         return self.centerline_points
@@ -572,7 +691,7 @@ class LinerGen:
         perp = q - np.outer(q @ a, a)               # componente perpendicular al eje
         R = float(np.linalg.norm(perp, axis=1).mean())   # radio de la esfera = radio perpendicular
 
-        # centro de la semiesfera según la dirección del segmento
+        # scentro de la semiesfera según la dirección del segmento
         C = punta - R * a
         d = np.linalg.norm(cap - C, axis=1)
         err = float(np.sqrt(np.mean((d - R) ** 2)) / R)
@@ -584,21 +703,30 @@ class LinerGen:
         n = cfg.N_PTS_REGRESION
         idx = np.arange(len(cl), dtype=float)
 
-        k = min(cfg.N_PTS_REGRESION, len(cl) - 1)
-        R_ini, err_ini = self._semiesfera_extremo(cl, punta_idx=0,  dir_idx=k)        # extremo inicio
-        R_fin, err_fin = self._semiesfera_extremo(cl, punta_idx=-1, dir_idx=-1 - k)   # extremo final
-        # --- 1. Identificar el extremo esférico (abajo) con dos semiesferas ---
-        # dirección de cada punta según el segmento del centerline en ese extremo
-        extremo_es_inicio = err_ini <= err_fin      # menor error = mejor semiesfera = abajo
-        print(f"Semiesfera inicio: R={R_ini:.2f} err={err_ini:.4f} | "
-            f"final: R={R_fin:.2f} err={err_fin:.4f} "
-            f"-> abajo = {'inicio (0)' if extremo_es_inicio else 'final (-1)'}")
-        
+        pb = cfg.punto_base() if cfg.USAR_BASE_ORIENTACION else None
+
+        if pb is not None:
+            # --- 1'. El usuario ya dijo dónde está la base: no hay que adivinar.
+            # compute_centerline dejó ese extremo en el índice 0.
+            extremo_es_inicio = True
+            print("Extremo inferior definido por el usuario:", np.round(pb, 3))
+        else:
+            k = min(cfg.N_PTS_REGRESION, len(cl) - 1)
+            R_ini, err_ini = self._semiesfera_extremo(cl, punta_idx=0,  dir_idx=k)        # extremo inicio
+            R_fin, err_fin = self._semiesfera_extremo(cl, punta_idx=-1, dir_idx=-1 - k)   # extremo final
+            # --- 1. Identificar el extremo esférico (abajo) con dos semiesferas ---
+            # dirección de cada punta según el segmento del centerline en ese extremo
+            extremo_es_inicio = err_ini <= err_fin      # menor error = mejor semiesfera = abajo
+            print(f"Semiesfera inicio: R={R_ini:.2f} err={err_ini:.4f} | "
+                f"final: R={R_fin:.2f} err={err_fin:.4f} "
+                f"-> abajo = {'inicio (0)' if extremo_es_inicio else 'final (-1)'}")
+
         # --- 2. Ajustar la recta a los N puntos del lado donde está el casquete ---
         if extremo_es_inicio:
             idx_fit = idx[:n]
             cl_fit = cl[:n]
-            punto_ancla = cl[0]
+            # la recta se ancla en el punto base para que el eje salga de ahí
+            punto_ancla = pb if pb is not None else cl[0]
         else:
             idx_fit = idx[-n:]
             cl_fit = cl[-n:]
@@ -629,6 +757,9 @@ class LinerGen:
         self.puntos_rot = self.puntos @ self.R.T
         self.centerline_rot = self.centerline_points @ self.R.T
         self.puntos_predichos_rot = self.puntos_predichos @ self.R.T
+
+        pb = self.cfg.punto_base()
+        self.punto_base_rot = None if pb is None else pb @ self.R.T
         return self.puntos_rot
 
     # --- 5) ordenar por Z descendente ---
@@ -664,6 +795,20 @@ class LinerGen:
         print("Más esférico:", info["mas_esferico"])
         return info
 
+    def orient_centerline_by_base(self):
+        """Deja ABAJO (índice 0) el extremo del centerline más cercano al punto
+        base marcado por el usuario."""
+        pb = self.cfg.punto_base()
+        cl = self.centerline_points
+        dA = float(np.linalg.norm(cl[0] - pb))
+        dB = float(np.linalg.norm(cl[-1] - pb))
+        print(f"Punto base -> extremo A: {dA:.2f} | extremo B: {dB:.2f}")
+        if dB < dA:
+            self.centerline_points = cl[::-1]
+            print("Centerline invertido: el extremo cercano al punto base queda ABAJO.")
+        self.sphere_info = None
+        return self.centerline_points
+
     def orient_centerline_by_sphere(self):
         """Coloca el extremo más esférico (mejor domo) en el índice 0 (abajo)."""
         cl = self.centerline_points
@@ -695,6 +840,9 @@ class LinerGen:
         self.crest.env_suave = rotate_z(self.crest.env_suave, theta, C)
         self.crest.min_3d = rotate_z(self.crest.min_3d, theta, C)
         self.crest.max_3d = rotate_z(self.crest.max_3d, theta, C)
+        if self.punto_base_rot is not None:
+            self.punto_base_rot = rotate_z(
+                np.asarray(self.punto_base_rot, float)[None, :3], theta, C)[0]
         print("Rotación en Z aplicada. theta =", round(float(theta), 4))
         return self.puntos_rot
 
