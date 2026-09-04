@@ -69,6 +69,13 @@ class Config:
     NODOS_Z2: int        = 4       # nodos internos del spline en Z de la intermedia
     N_MUESTRAS_Z: int | None = None  # anillos medidos por rebanado (None -> auto)
 
+    # --- Banda de la cresta (Z3) ---
+    # El cuerpo termina un poco POR DEBAJO del punto más bajo de la cresta. Sin
+    # ese margen, la columna donde la cresta toca fondo se queda sin altura y
+    # todos los anillos de Z3 se encinan ahí.
+    MARGEN_CRESTA: float = 0.10    # fracción del largo del tubo que se reserva para la banda
+    TENSION_CRESTA: float = 1.0    # tensión del spline al llegar a la cresta
+
     # --- Sellado inferior: casquete esférico ---
     SELLAR_BASE: bool    = True    # cerrar el fondo con un casquete + ápice
     N_CAP: int           = 6       # anillos del casquete entre el ápice y el cuerpo
@@ -486,19 +493,27 @@ class Mesh:
         frac_cap = float(np.clip(cfg.FRAC_CAP_Z, 0.0, 0.6)) if cfg.SELLAR_BASE else 0.0
         z_body = z_bottom + frac_cap * span
 
-        # Z2 es la franja de arriba, pegada a la cresta. Z1 es todo lo de abajo.
+        # El cuerpo termina POR DEBAJO del punto más bajo de la cresta: ese margen
+        # es la banda donde vive Z3, y garantiza que toda columna angular tenga
+        # altura para repartir sus anillos.
+        margen = float(np.clip(cfg.MARGEN_CRESTA, 0.0, 0.5)) * (z_crest_start - z_body)
+        z_tubo = z_crest_start - margen
+        self.z_tubo, self.margen_cresta = z_tubo, margen
+
+        # Z2 es la franja de arriba del tubo. Z1 es todo lo de abajo.
         frac2 = float(np.clip(cfg.FRAC_Z2, 0.05, 0.95))
-        z_split = z_crest_start - frac2 * (z_crest_start - z_body)
+        z_split = z_tubo - frac2 * (z_tubo - z_body)
         self.z_body_start, self.z_split = z_body, z_split
         print(f"z_bottom={z_bottom:.2f}  z_body={z_body:.2f}  z_split={z_split:.2f}  "
-              f"z_crest_start={z_crest_start:.2f}  z_crest_top={self.z_crest_top:.2f}")
+              f"z_tubo={z_tubo:.2f}  z_crest_start={z_crest_start:.2f}  "
+              f"z_crest_top={self.z_crest_top:.2f}")
 
         n_z1, n_z2 = cfg.n_z1(), cfg.n_z2()
 
         # Se mide una sola vez todo el tramo tubular; luego cada zona ajusta su
         # propio spline sobre los anillos que le tocan.
         n_muestras = cfg.N_MUESTRAS_Z or max(cfg.N_SLICES, n_z1 + n_z2)
-        rows_m, zs_m = self._medir_anillos(z_body, z_crest_start, n_muestras)
+        rows_m, zs_m = self._medir_anillos(z_body, z_tubo, n_muestras)
         if len(rows_m) < 4:
             raise ValueError(
                 "Muy pocos anillos medidos (%d). Baja '# nodos splines' o revisa "
@@ -511,7 +526,7 @@ class Mesh:
         sel2 = slice(max(0, min(i_split - 2, len(zs_m) - 4)), len(zs_m))
 
         niv1 = np.linspace(z_body, z_split, n_z1 + 1)
-        niv2 = np.linspace(z_split, z_crest_start, n_z2 + 1)
+        niv2 = np.linspace(z_split, z_tubo, n_z2 + 1)
 
         r1 = self._spline_z(rows_m[sel1], zs_m[sel1], niv1, cfg.NODOS_Z1)
         r2 = self._spline_z(rows_m[sel2], zs_m[sel2], niv2, cfg.NODOS_Z2)
@@ -571,17 +586,61 @@ class Mesh:
         print(f"Casquete: {self.rows_cap.shape} | ápice z={apice[2]:.2f} "
               f"| altura del domo={anillo0[:, 2].mean() - apice[2]:.2f}")
 
-    # --- Zona 3: transición alineada a la cresta ---
+    # --- Zona 3: banda de la cresta, un spline por columna angular ---
     def _part2(self):
+        """Sube del borde del cuerpo hasta la cresta.
+
+        Aquí estaba el problema de los anillos encimados. Antes todas las
+        columnas compartían el mismo reparto (`smoothstep` global) mezclando un
+        anillo plano con la cresta, así que:
+
+          - en la columna donde la cresta toca fondo no había altura que repartir
+            y los `n_z3` anillos caían unos sobre otros;
+          - el `smoothstep` tiene derivada cero al llegar, así que además
+            apretujaba los últimos anillos contra la cresta en todas partes.
+
+        Ahora cada columna reparte SU propio tramo (de su z inicial a su z de
+        cresta) en pasos iguales, y la forma la da un spline de Hermite cúbico
+        que sale del cuerpo con su misma pendiente y aterriza exacto en la cresta.
+        """
         cfg = self.p.cfg
         env_suave = self.p.crest.env_suave
         crest_cols = self.resample_ring_spline(env_suave[:, :3])
-        last_ring = self.rows1[-1]
-        f_lin = np.linspace(0, 1, cfg.n_z3() + 1)[1:]
-        fs = f_lin * f_lin * (3 - 2 * f_lin)          # smoothstep
-        self.rows2 = np.array([(1 - f) * last_ring + f * crest_cols for f in fs])
+        anillo_ini = self.rows1[-1]
+        anillo_prev = self.rows1[-2] if len(self.rows1) > 1 else anillo_ini
+
+        z_ini = anillo_ini[:, 2]
+        z_fin = crest_cols[:, 2]
+        dz = z_fin - z_ini
+        if np.any(dz <= 0):
+            n_mal = int(np.sum(dz <= 0))
+            print(f"Aviso: {n_mal} columnas con la cresta por debajo del cuerpo. "
+                  f"Sube 'Margen bajo la cresta'.")
+            dz = np.maximum(dz, 1e-6)
+
+        # pendiente con la que venía el cuerpo (dxy/dz), para salir sin quiebre
+        dz_prev = np.maximum(anillo_ini[:, 2] - anillo_prev[:, 2], 1e-9)
+        pend = (anillo_ini[:, :2] - anillo_prev[:, :2]) / dz_prev[:, None]
+
+        m0 = pend * dz[:, None]                                    # tangente al salir
+        m1 = (crest_cols[:, :2] - anillo_ini[:, :2]) * cfg.TENSION_CRESTA   # al llegar
+
+        n_z3 = cfg.n_z3()
+        rows = []
+        for u in np.linspace(0.0, 1.0, n_z3 + 1)[1:]:
+            h00 = 2 * u ** 3 - 3 * u ** 2 + 1
+            h10 = u ** 3 - 2 * u ** 2 + u
+            h01 = -2 * u ** 3 + 3 * u ** 2
+            h11 = u ** 3 - u ** 2
+            xy = (h00 * anillo_ini[:, :2] + h10 * m0
+                  + h01 * crest_cols[:, :2] + h11 * m1)
+            z = z_ini + dz * u                 # cada columna, su propio reparto
+            rows.append(np.column_stack([xy, z]))
+
+        self.rows2 = np.array(rows)
         self.rows_z3 = self.rows2
-        print("Zona 3:", self.rows2.shape,
+        print("Z3 cresta:", self.rows2.shape,
+              "| tramo por columna: min=%.2f max=%.2f" % (dz.min(), dz.max()),
               "| borde superior = cresta:", np.allclose(self.rows2[-1], crest_cols))
 
     # --- ensamblar malla + caras ---
