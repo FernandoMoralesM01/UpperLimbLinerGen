@@ -1,5 +1,5 @@
 """
-Liner Mesh Generator — addon de Blender.
+Retopologia Mesh Generator — addon de Blender.
 
 Flujo:
     1) Preparar escaneo    -> duplica el escaneo, lo pinta de gris y entra a
@@ -11,26 +11,29 @@ Flujo:
 """
 
 bl_info = {
-    "name": "Liner Mesh Generator",
+    "name": "Retopologia Mesh Generator",
     "author": "Fernando Morales Magallón",
     "version": (1, 2, 0),
     "blender": (5, 0, 0),
-    "location": "View3D > Sidebar (N) > Liner",
-    "description": "Pinta la region, segmenta el escaneo y reconstruye el liner",
+    "location": "View3D > Sidebar (N) > Retopologia",
+    "description": "Pinta la region, segmenta el escaneo y reconstruye la retopologia",
     "category": "Mesh",
 }
 
 import numpy as np
 import bpy
 from bpy.props import (IntProperty, FloatProperty, BoolProperty,
-                       EnumProperty, PointerProperty)
+                       EnumProperty, PointerProperty, FloatVectorProperty)
 from bpy.types import Operator, Panel, PropertyGroup
+from bpy_extras import view3d_utils
+from mathutils import Vector
 
 from . import linergen
 
 PAINT_ATTR = "crest_paint"
 GRIS = (0.7, 0.7, 0.7, 0.7)
 ROJO = (0.0, 0.0, 0.0)
+EMPTY_BASE = "Retopologia_PuntoBase"
 
 
 # ----------------------------------------------------------------------
@@ -46,8 +49,21 @@ def puntos_de_objeto(obj):
     return (co_h @ mw.T)[:, :3]
 
 
+def _habilitar_user_site():
+    """Hace visible para Blender el site-packages del usuario de su propio Python."""
+    import site
+    import sys
+    try:
+        user_site = site.getusersitepackages()
+        if user_site and user_site not in sys.path:
+            site.addsitedir(user_site)
+    except Exception:
+        pass
+
+
 def scipy_disponible():
     try:
+        _habilitar_user_site()
         import scipy  # noqa: F401
         return True
     except Exception:
@@ -101,9 +117,48 @@ def _mascara_pintada(mesh, tol):
 
 
 # ----------------------------------------------------------------------
+# Punto base (extremo inferior del muñon)
+# ----------------------------------------------------------------------
+def _empty_base(crear=False):
+    """Empty que marca el punto base en el viewport."""
+    e = bpy.data.objects.get(EMPTY_BASE)
+    if e is None and crear:
+        e = bpy.data.objects.new(EMPTY_BASE, None)
+        e.empty_display_type = 'SPHERE'
+        e.show_in_front = True
+        bpy.context.collection.objects.link(e)
+    return e
+
+
+def _fijar_punto_base(context, co_mundo, escala=1.0):
+    pr = context.scene.retopologia_props
+    pr.punto_base = co_mundo
+    pr.punto_base_ok = True
+    e = _empty_base(crear=True)
+    e.location = co_mundo
+    e.empty_display_size = max(1e-4, 0.05 * escala)
+    return e
+
+
+def _obtener_punto_base(context):
+    """Devuelve el punto base como np.array(3,), o None.
+
+    Si el Empty existe, manda su posicion: asi puedes reajustarlo a mano
+    moviendolo en el viewport sin volver a hacer clic.
+    """
+    pr = context.scene.retopologia_props
+    if not pr.punto_base_ok:
+        return None
+    e = _empty_base()
+    if e is not None:
+        return np.array(e.matrix_world.translation, dtype=float)
+    return np.array(pr.punto_base, dtype=float)
+
+
+# ----------------------------------------------------------------------
 # Propiedades
 # ----------------------------------------------------------------------
-class LinerProps(PropertyGroup):
+class RetopologiaProps(PropertyGroup):
     # --- segmentacion ---
     lado: EnumProperty(
         name="Conservar",
@@ -128,8 +183,33 @@ class LinerProps(PropertyGroup):
     n_circ:     IntProperty(name="# puntos en cada segmento", default=40, min=6, max=360)
     n_nodos:    IntProperty(name="# nodos splines", default=10, min=2, max=60)
     suav_env:   FloatProperty(name="factor de suavizado cresta", default=1.0, min=0.0, max=50.0)
-    #n_z1:       FloatProperty(name="# anillos parte inferior", default=None, min=5.0, max=1000.0)
-    #n_z2:       FloatProperty(name="# anillos parte superior", default=None, min=2.0, max=1000.0)
+
+    # --- punto base ---
+    punto_base: FloatVectorProperty(
+        name="Punto base", subtype='XYZ', size=3, default=(0.0, 0.0, 0.0),
+        description="Punto de hasta abajo del muñon, en coordenadas de mundo")
+    punto_base_ok: BoolProperty(name="Punto base definido", default=False)
+    usar_base_orient: BoolProperty(
+        name="Orientar con el punto base", default=True,
+        description="El punto base decide que extremo va abajo, en vez de la "
+                    "heuristica de las semiesferas")
+    usar_base_apice: BoolProperty(
+        name="Sellar la base en ese punto", default=True,
+        description="El apice del sellado y el z inferior de la malla salen del punto base")
+
+    # --- zonas en Z (tres splines) ---
+    n_z1: IntProperty(name="# anillos Z1 (casquete)", default=12, min=2, max=400,
+                      description="Anillos de la zona inferior, sobre el casquete")
+    n_z2: IntProperty(name="# anillos Z2 (cuerpo)", default=18, min=2, max=400,
+                      description="Anillos de la zona media, el tubo")
+    n_z3: IntProperty(name="# anillos Z3 (cresta)", default=10, min=1, max=400,
+                      description="Anillos de la transicion hasta la cresta")
+    frac_z1: FloatProperty(
+        name="Fracción Z1", default=0.30, min=0.05, max=0.95,
+        description="Parte del tramo base->cresta que ocupa Z1. El resto es Z2")
+    nodos_z1: IntProperty(name="Nodos spline Z1", default=4, min=1, max=30)
+    nodos_z2: IntProperty(name="Nodos spline Z2", default=6, min=1, max=30)
+    zonas_avanzado: BoolProperty(name="Ajustes avanzados de zonas", default=False)
 
     sellar_base:     BoolProperty(name="Sellar base", default=True)
     orient_esferico: BoolProperty(name="Extremo esferico abajo", default=True)
@@ -139,8 +219,8 @@ class LinerProps(PropertyGroup):
 # ----------------------------------------------------------------------
 # Operadores
 # ----------------------------------------------------------------------
-class LINER_OT_prepare(Operator):
-    bl_idname = "liner.prepare"
+class RETOPOLOGIA_OT_prepare(Operator):
+    bl_idname = "retopologia.prepare"
     bl_label = "Preparar escaneo (pintar region)"
     bl_description = "Duplica el escaneo, lo pinta de gris y entra a Vertex Paint (brocha roja)"
 
@@ -176,8 +256,8 @@ class LINER_OT_prepare(Operator):
         return {'FINISHED'}
 
 
-class LINER_OT_cut(Operator):
-    bl_idname = "liner.cut"
+class RETOPOLOGIA_OT_cut(Operator):
+    bl_idname = "retopologia.cut"
     bl_label = "Segmentar por pintura"
     bl_description = "Binariza lo pintado y crea un objeto nuevo con la segmentacion"
 
@@ -190,7 +270,7 @@ class LINER_OT_cut(Operator):
         if obj.mode != 'OBJECT':
             bpy.ops.object.mode_set(mode='OBJECT')
 
-        pr = context.scene.liner_props
+        pr = context.scene.retopologia_props
         painted = _mascara_pintada(obj.data, pr.tol_rojo)
         if painted is None:
             self.report({'ERROR'}, "No hay capa de pintura. Usa 'Preparar escaneo' primero.")
@@ -225,7 +305,7 @@ class LINER_OT_cut(Operator):
             o.select_set(False)
         new_obj.select_set(True)
         context.view_layer.objects.active = new_obj
-        self.report({'INFO'}, "Segmentado: %d vertices. Ya puedes 'Generar malla'." % len(new_mesh.vertices))
+        self.report({'INFO'}, "Segmentado: %d vertices. Ya puedes 'Generar retopologia'." % len(new_mesh.vertices))
         return {'FINISHED'}
 
     @staticmethod
@@ -254,29 +334,230 @@ class LINER_OT_cut(Operator):
         bmesh.ops.delete(bm, geom=borrar, context='VERTS')
 
 
-class LINER_OT_install_scipy(Operator):
-    bl_idname = "liner.install_scipy"
+class RETOPOLOGIA_OT_install_scipy(Operator):
+    bl_idname = "retopologia.install_scipy"
     bl_label = "Instalar SciPy"
     bl_description = "Instala SciPy en el Python de Blender (requiere internet)"
 
     def execute(self, context):
-        import subprocess, sys
+        import os
+        import subprocess
+        import sys
+        import site
+
+        # Blender instalado en Program Files normalmente no permite escribir
+        # en su propio site-packages sin permisos de administrador. Por eso
+        # instalamos SciPy en el site-packages del usuario y lo añadimos
+        # explícitamente al sys.path de Blender.
         try:
-            subprocess.check_call([sys.executable, "-m", "ensurepip", "--user"])
-        except Exception:
-            pass
-        try:
-            subprocess.check_call([sys.executable, "-m", "pip", "install", "scipy"])
+            user_site = site.getusersitepackages()
+            os.makedirs(user_site, exist_ok=True)
+
+            env = os.environ.copy()
+            env.pop("PYTHONNOUSERSITE", None)
+
+            subprocess.check_call([
+                sys.executable, "-m", "ensurepip", "--user"
+            ], env=env)
+
+            subprocess.check_call([
+                sys.executable, "-m", "pip", "install",
+                "--user", "--upgrade", "scipy"
+            ], env=env)
+
+            if user_site not in sys.path:
+                site.addsitedir(user_site)
+
+            # Si SciPy ya estaba cargado de forma incorrecta, quitamos su
+            # entrada para que el siguiente import use la instalación nueva.
+            for name in list(sys.modules):
+                if name == "scipy" or name.startswith("scipy."):
+                    del sys.modules[name]
+
+            import scipy
+            self.report(
+                {'INFO'},
+                "SciPy %s instalado correctamente. Ya puedes generar la retopologia."
+                % scipy.__version__
+            )
+            return {'FINISHED'}
+
         except Exception as e:
-            self.report({'ERROR'}, "No se pudo instalar SciPy: %s" % e)
+            self.report(
+                {'ERROR'},
+                "No se pudo instalar SciPy: %s" % e
+            )
             return {'CANCELLED'}
-        self.report({'INFO'}, "SciPy instalado. Reinicia Blender si el import falla.")
+
+
+# ----------------------------------------------------------------------
+# Operadores: punto base
+# ----------------------------------------------------------------------
+class RETOPOLOGIA_OT_pick_base(Operator):
+    bl_idname = "retopologia.pick_base"
+    bl_label = "Elegir punto base (clic)"
+    bl_description = ("Haz clic sobre la malla para marcar el punto de hasta abajo "
+                      "del muñon. Esc o clic derecho para cancelar")
+
+    _obj = None
+
+    def invoke(self, context, event):
+        obj = context.active_object
+        if obj is None or obj.type != 'MESH':
+            self.report({'ERROR'}, "Selecciona primero el objeto segmentado.")
+            return {'CANCELLED'}
+        if context.area is None or context.area.type != 'VIEW_3D':
+            self.report({'ERROR'}, "Ejecuta esto desde la vista 3D.")
+            return {'CANCELLED'}
+        if obj.mode != 'OBJECT':
+            bpy.ops.object.mode_set(mode='OBJECT')
+
+        self._obj = obj
+        context.window.cursor_modal_set('EYEDROPPER')
+        context.workspace.status_text_set(
+            "Clic izquierdo: fijar el punto base   |   Esc o clic derecho: cancelar")
+        context.window_manager.modal_handler_add(self)
+        return {'RUNNING_MODAL'}
+
+    def _fin(self, context):
+        context.window.cursor_modal_restore()
+        context.workspace.status_text_set(None)
+
+    def modal(self, context, event):
+        if event.type in {'RIGHTMOUSE', 'ESC'}:
+            self._fin(context)
+            return {'CANCELLED'}
+
+        # que la navegacion siga funcionando mientras se elige
+        if event.type in {'MIDDLEMOUSE', 'WHEELUPMOUSE', 'WHEELDOWNMOUSE'}:
+            return {'PASS_THROUGH'}
+
+        if event.type == 'LEFTMOUSE' and event.value == 'PRESS':
+            co = self._raycast(context, event)
+            if co is None:
+                self.report({'WARNING'}, "El rayo no toco la malla. Intenta otra vez.")
+                return {'RUNNING_MODAL'}
+            _fijar_punto_base(context, co, max(self._obj.dimensions))
+            self._fin(context)
+            self.report({'INFO'}, "Punto base: (%.3f, %.3f, %.3f)" % (co.x, co.y, co.z))
+            return {'FINISHED'}
+
+        return {'RUNNING_MODAL'}
+
+    def _raycast(self, context, event):
+        region = context.region
+        rv3d = context.region_data
+        if region is None or rv3d is None:
+            return None
+
+        coord = (event.mouse_region_x, event.mouse_region_y)
+        origen = view3d_utils.region_2d_to_origin_3d(region, rv3d, coord)
+        direccion = view3d_utils.region_2d_to_vector_3d(region, rv3d, coord)
+
+        obj = self._obj
+        mwi = obj.matrix_world.inverted()
+        o = mwi @ origen
+        d = (mwi.to_3x3() @ direccion).normalized()
+
+        ok, loc, nor, cara = obj.ray_cast(o, d)
+        if not ok:
+            return None
+
+        # engancha al vertice mas cercano de la cara tocada
+        me = obj.data
+        if 0 <= cara < len(me.polygons):
+            mejor, dmin = None, 1e30
+            for vi in me.polygons[cara].vertices:
+                v = me.vertices[vi].co
+                dd = (v - loc).length_squared
+                if dd < dmin:
+                    dmin, mejor = dd, v
+            if mejor is not None:
+                loc = mejor
+
+        return obj.matrix_world @ Vector(loc)
+
+
+class RETOPOLOGIA_OT_base_lowest(Operator):
+    bl_idname = "retopologia.base_lowest"
+    bl_label = "Punto base = vértice más bajo"
+    bl_description = "Toma el vertice de menor Z en coordenadas de mundo"
+
+    def execute(self, context):
+        obj = context.active_object
+        if obj is None or obj.type != 'MESH':
+            self.report({'ERROR'}, "Selecciona el objeto segmentado.")
+            return {'CANCELLED'}
+        pts = puntos_de_objeto(obj)
+        if len(pts) == 0:
+            self.report({'ERROR'}, "La malla no tiene vertices.")
+            return {'CANCELLED'}
+        co = pts[int(np.argmin(pts[:, 2]))]
+        _fijar_punto_base(context, Vector((float(co[0]), float(co[1]), float(co[2]))),
+                          max(obj.dimensions))
+        self.report({'INFO'}, "Punto base = vertice mas bajo en Z.")
         return {'FINISHED'}
 
 
-class LINER_OT_generate(Operator):
-    bl_idname = "liner.generate"
-    bl_label = "Generar malla del liner"
+class RETOPOLOGIA_OT_base_from_selection(Operator):
+    bl_idname = "retopologia.base_from_selection"
+    bl_label = "Punto base = selección"
+    bl_description = "Usa el vertice seleccionado, o el promedio de la seleccion"
+
+    def execute(self, context):
+        obj = context.active_object
+        if obj is None or obj.type != 'MESH':
+            self.report({'ERROR'}, "Selecciona el objeto segmentado.")
+            return {'CANCELLED'}
+
+        modo = obj.mode
+        if modo == 'EDIT':
+            bpy.ops.object.mode_set(mode='OBJECT')   # refresca la seleccion
+        sel = [v.co.copy() for v in obj.data.vertices if v.select]
+        if modo == 'EDIT':
+            bpy.ops.object.mode_set(mode='EDIT')
+
+        if not sel:
+            self.report({'ERROR'}, "No hay vertices seleccionados.")
+            return {'CANCELLED'}
+
+        co = Vector((0.0, 0.0, 0.0))
+        for v in sel:
+            co += v
+        co /= len(sel)
+        _fijar_punto_base(context, obj.matrix_world @ co, max(obj.dimensions))
+        self.report({'INFO'}, "Punto base desde %d vertices." % len(sel))
+        return {'FINISHED'}
+
+
+class RETOPOLOGIA_OT_base_from_cursor(Operator):
+    bl_idname = "retopologia.base_from_cursor"
+    bl_label = "Punto base = cursor 3D"
+    bl_description = "Usa la posicion actual del cursor 3D"
+
+    def execute(self, context):
+        obj = context.active_object
+        esc = max(obj.dimensions) if obj is not None and obj.type == 'MESH' else 1.0
+        _fijar_punto_base(context, context.scene.cursor.location.copy(), esc)
+        return {'FINISHED'}
+
+
+class RETOPOLOGIA_OT_base_clear(Operator):
+    bl_idname = "retopologia.base_clear"
+    bl_label = "Borrar punto base"
+    bl_description = "Olvida el punto base y vuelve a la deteccion automatica"
+
+    def execute(self, context):
+        context.scene.retopologia_props.punto_base_ok = False
+        e = _empty_base()
+        if e is not None:
+            bpy.data.objects.remove(e, do_unlink=True)
+        return {'FINISHED'}
+
+
+class RETOPOLOGIA_OT_generate(Operator):
+    bl_idname = "retopologia.generate"
+    bl_label = "Generar retopologia"
     bl_description = "Reconstruye el liner a partir del objeto seleccionado (el segmentado)"
 
     def execute(self, context):
@@ -290,7 +571,7 @@ class LINER_OT_generate(Operator):
         if obj.mode != 'OBJECT':
             bpy.ops.object.mode_set(mode='OBJECT')
 
-        pr = context.scene.liner_props
+        pr = context.scene.retopologia_props
         puntos = puntos_de_objeto(obj)
         if len(puntos) < 100:
             self.report({'ERROR'}, "Muy pocos vertices (%d)." % len(puntos))
@@ -298,9 +579,14 @@ class LINER_OT_generate(Operator):
 
         cfg = linergen.Config(
             N_SLICES=pr.n_slices, N_BINS_ENV=pr.n_bins_env, N_CIRC=pr.n_circ,
-            N_PTS_REGRESION=pr.n_pts_reg, ORDEN_K=pr.orden_k,  
+            N_PTS_REGRESION=pr.n_pts_reg, ORDEN_K=pr.orden_k,
             N_NODOS_SECCION=pr.n_nodos, SUAVIZADO_ENV=pr.suav_env,
             FRAC_CASQUETE=pr.frac_casquete,
+            N_Z1=pr.n_z1, N_Z2=pr.n_z2, N_Z3=pr.n_z3,
+            FRAC_Z1=pr.frac_z1, NODOS_Z1=pr.nodos_z1, NODOS_Z2=pr.nodos_z2,
+            PUNTO_BASE=_obtener_punto_base(context),
+            USAR_BASE_ORIENTACION=pr.usar_base_orient,
+            USAR_BASE_APICE=pr.usar_base_apice,
             SELLAR_BASE=pr.sellar_base, ORIENT_SPHERICAL_DOWN=pr.orient_esferico,
             APLICAR_ROTACION_Z=pr.rotacion_z, IFSHOW=False,
         )
@@ -316,13 +602,13 @@ class LINER_OT_generate(Operator):
             self.report({'ERROR'}, "Fallo el pipeline: %s" % e)
             return {'CANCELLED'}
 
-        mesh = bpy.data.meshes.new("Liner_mesh")
+        mesh = bpy.data.meshes.new("Retopologia_mesh")
         verts = [tuple(map(float, v)) for v in gen.mesh.vertices]
         faces = [tuple(int(i) for i in f) for f in gen.mesh.caras]
         mesh.from_pydata(verts, [], faces)
         mesh.validate(clean_customdata=False)
         mesh.update()
-        nuevo = bpy.data.objects.new("Liner", mesh)
+        nuevo = bpy.data.objects.new("Retopologia", mesh)
         context.collection.objects.link(nuevo)
 
         M = np.eye(4); M[:3, :3] = np.array(gen.R).T
@@ -332,65 +618,113 @@ class LINER_OT_generate(Operator):
             o.select_set(False)
         nuevo.select_set(True)
         context.view_layer.objects.active = nuevo
-        self.report({'INFO'}, "Liner generado: %d vertices." % len(gen.mesh.vertices))
+        self.report({'INFO'}, "Retopologia generada: %d vertices." % len(gen.mesh.vertices))
         return {'FINISHED'}
 
 
 # ----------------------------------------------------------------------
 # Panel
 # ----------------------------------------------------------------------
-class LINER_PT_panel(Panel):
-    bl_label = "Liner Mesh Generator"
-    bl_idname = "LINER_PT_panel"
+class RETOPOLOGIA_PT_panel(Panel):
+    bl_label = "Retopologia Mesh Generator"
+    bl_idname = "RETOPOLOGIA_PT_panel"
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
-    bl_category = "Liner"
+    bl_category = "Retopologia"
 
     def draw(self, context):
         layout = self.layout
-        pr = context.scene.liner_props
+        pr = context.scene.retopologia_props
 
         box = layout.box()
         box.label(text="1) Pintar la region", icon='BRUSH_DATA')
-        box.operator("liner.prepare", icon='GREASEPENCIL')
+        box.operator("retopologia.prepare", icon='GREASEPENCIL')
 
         box = layout.box()
         box.label(text="2) Segmentar por pintura", icon='MOD_MASK')
         box.prop(pr, "lado")
         box.prop(pr, "tol_rojo")
         box.prop(pr, "solo_mayor_isla")
-        box.operator("liner.cut", icon='MOD_BOOLEAN')
+        box.operator("retopologia.cut", icon='MOD_BOOLEAN')
 
+        # ---------------- punto base ----------------
         box = layout.box()
-        box.label(text="3) Generar malla", icon='MESH_CYLINDER')
+        fila = box.row()
+        fila.label(text="3) Punto base del muñon", icon='PIVOT_CURSOR')
+        if pr.punto_base_ok:
+            fila.label(text="", icon='CHECKMARK')
+
+        box.operator("retopologia.pick_base", icon='EYEDROPPER')
+        sub = box.row(align=True)
+        sub.operator("retopologia.base_lowest", text="Más bajo", icon='SORT_ASC')
+        sub.operator("retopologia.base_from_selection", text="Selección", icon='VERTEXSEL')
+        sub.operator("retopologia.base_from_cursor", text="Cursor", icon='CURSOR')
+
+        if pr.punto_base_ok:
+            col = box.column(align=True)
+            col.enabled = False
+            col.prop(pr, "punto_base", text="")
+            box.label(text="Puedes mover el Empty '%s'." % EMPTY_BASE, icon='INFO')
+            box.prop(pr, "usar_base_orient")
+            box.prop(pr, "usar_base_apice")
+            box.operator("retopologia.base_clear", text="Borrar punto base", icon='X')
+        else:
+            box.label(text="Sin punto base se usa la heurística de esferas.", icon='ERROR')
+
+        # ---------------- generacion ----------------
+        box = layout.box()
+        box.label(text="4) Generar malla", icon='MESH_CYLINDER')
         if not scipy_disponible():
             b = box.box()
             b.label(text="Falta SciPy", icon='ERROR')
-            b.operator("liner.install_scipy", icon='CONSOLE')
+            b.operator("retopologia.install_scipy", icon='CONSOLE')
         col = box.column(align=True)
         col.prop(pr, "n_slices"); col.prop(pr, "n_bins_env")
         col.prop(pr, "n_pts_reg"); col.prop(pr, "orden_k")
-                  
+
         col.prop(pr, "n_circ"); col.prop(pr, "n_nodos"); col.prop(pr, "suav_env")
         col.prop(pr, "frac_casquete")
-        
+
+        # ---- zonas en Z ----
+        zb = box.box()
+        zb.label(text="Zonas en Z (3 splines)", icon='IPO_BEZIER')
+        col = zb.column(align=True)
+        col.prop(pr, "n_z1")
+        col.prop(pr, "n_z2")
+        col.prop(pr, "n_z3")
+        zb.prop(pr, "frac_z1", slider=True)
+        zb.label(text="Z1: 0-%d%% del tramo base->cresta | Z2: el resto | Z3: hasta la cresta"
+                      % int(round(pr.frac_z1 * 100)))
+        zb.prop(pr, "zonas_avanzado", toggle=True)
+        if pr.zonas_avanzado:
+            col = zb.column(align=True)
+            col.prop(pr, "nodos_z1")
+            col.prop(pr, "nodos_z2")
+        zb.label(text="Anillos totales: %d" % (pr.n_z1 + 1 + pr.n_z2 + pr.n_z3),
+                 icon='MESH_GRID')
+
         col = box.column(align=True)
         col.prop(pr, "sellar_base"); col.prop(pr, "orient_esferico"); col.prop(pr, "rotacion_z")
-        box.operator("liner.generate", icon='MESH_CYLINDER')
+        box.operator("retopologia.generate", icon='MESH_CYLINDER')
 
 
-_clases = (LinerProps, LINER_OT_prepare, LINER_OT_cut,
-           LINER_OT_install_scipy, LINER_OT_generate, LINER_PT_panel)
+_clases = (RetopologiaProps,
+           RETOPOLOGIA_OT_prepare, RETOPOLOGIA_OT_cut,
+           RETOPOLOGIA_OT_pick_base, RETOPOLOGIA_OT_base_lowest,
+           RETOPOLOGIA_OT_base_from_selection, RETOPOLOGIA_OT_base_from_cursor,
+           RETOPOLOGIA_OT_base_clear,
+           RETOPOLOGIA_OT_install_scipy, RETOPOLOGIA_OT_generate,
+           RETOPOLOGIA_PT_panel)
 
 
 def register():
     for c in _clases:
         bpy.utils.register_class(c)
-    bpy.types.Scene.liner_props = PointerProperty(type=LinerProps)
+    bpy.types.Scene.retopologia_props = PointerProperty(type=RetopologiaProps)
 
 
 def unregister():
-    del bpy.types.Scene.liner_props
+    del bpy.types.Scene.retopologia_props
     for c in reversed(_clases):
         bpy.utils.unregister_class(c)
 
