@@ -197,21 +197,28 @@ class RetopologiaProps(PropertyGroup):
         name="Sellar la base en ese punto", default=True,
         description="El apice del sellado y el z inferior de la malla salen del punto base")
 
-    # --- zonas en Z (tres splines) ---
-    n_z1: IntProperty(name="# anillos Z1 (casquete)", default=12, min=2, max=400,
-                      description="Anillos de la zona inferior, sobre el casquete")
-    n_z2: IntProperty(name="# anillos Z2 (cuerpo)", default=18, min=2, max=400,
-                      description="Anillos de la zona media, el tubo")
+    # --- zonas en Z (tres splines, de abajo hacia arriba) ---
+    n_z1: IntProperty(name="# anillos Z1 (cuerpo)", default=20, min=2, max=400,
+                      description="Anillos del cuerpo, el tramo tubular")
+    n_z2: IntProperty(name="# anillos Z2 (intermedia)", default=10, min=2, max=400,
+                      description="Anillos de la franja entre el cuerpo y la cresta")
     n_z3: IntProperty(name="# anillos Z3 (cresta)", default=10, min=1, max=400,
-                      description="Anillos de la transicion hasta la cresta")
-    frac_z1: FloatProperty(
-        name="Fracción Z1", default=0.30, min=0.05, max=0.95,
-        description="Parte del tramo base->cresta que ocupa Z1. El resto es Z2")
-    nodos_z1: IntProperty(name="Nodos spline Z1", default=4, min=1, max=30)
-    nodos_z2: IntProperty(name="Nodos spline Z2", default=6, min=1, max=30)
+                      description="Anillos de la transicion que aterriza sobre la cresta")
+    frac_z2: FloatProperty(
+        name="Fracción Z2", default=0.25, min=0.05, max=0.95,
+        description="Franja de arriba del tubo que ocupa Z2. El resto es Z1")
+    nodos_z1: IntProperty(name="Nodos spline Z1", default=6, min=1, max=30)
+    nodos_z2: IntProperty(name="Nodos spline Z2", default=4, min=1, max=30)
     zonas_avanzado: BoolProperty(name="Ajustes avanzados de zonas", default=False)
 
-    sellar_base:     BoolProperty(name="Sellar base", default=True)
+    # --- casquete inferior ---
+    n_cap: IntProperty(name="# anillos del casquete", default=6, min=1, max=60,
+                       description="Anillos del domo, entre el apice y el cuerpo")
+    frac_cap_z: FloatProperty(
+        name="Altura del casquete", default=0.15, min=0.0, max=0.6,
+        description="Parte del tramo base->cresta que ocupa el casquete")
+
+    sellar_base:     BoolProperty(name="Sellar base (casquete)", default=True)
     orient_esferico: BoolProperty(name="Extremo esferico abajo", default=True)
     rotacion_z:      BoolProperty(name="Rotacion Z (alinear minimo)", default=False)
     frac_casquete: FloatProperty(name="Fracción del largo casquete", default=0.3, min=0.1, max=0.8)
@@ -583,7 +590,8 @@ class RETOPOLOGIA_OT_generate(Operator):
             N_NODOS_SECCION=pr.n_nodos, SUAVIZADO_ENV=pr.suav_env,
             FRAC_CASQUETE=pr.frac_casquete,
             N_Z1=pr.n_z1, N_Z2=pr.n_z2, N_Z3=pr.n_z3,
-            FRAC_Z1=pr.frac_z1, NODOS_Z1=pr.nodos_z1, NODOS_Z2=pr.nodos_z2,
+            FRAC_Z2=pr.frac_z2, NODOS_Z1=pr.nodos_z1, NODOS_Z2=pr.nodos_z2,
+            N_CAP=pr.n_cap, FRAC_CAP_Z=pr.frac_cap_z,
             PUNTO_BASE=_obtener_punto_base(context),
             USAR_BASE_ORIENTACION=pr.usar_base_orient,
             USAR_BASE_APICE=pr.usar_base_apice,
@@ -687,24 +695,35 @@ class RETOPOLOGIA_PT_panel(Panel):
 
         # ---- zonas en Z ----
         zb = box.box()
-        zb.label(text="Zonas en Z (3 splines)", icon='IPO_BEZIER')
+        zb.label(text="Zonas en Z (3 splines, de abajo a arriba)", icon='IPO_BEZIER')
         col = zb.column(align=True)
         col.prop(pr, "n_z1")
         col.prop(pr, "n_z2")
         col.prop(pr, "n_z3")
-        zb.prop(pr, "frac_z1", slider=True)
-        zb.label(text="Z1: 0-%d%% del tramo base->cresta | Z2: el resto | Z3: hasta la cresta"
-                      % int(round(pr.frac_z1 * 100)))
+        zb.prop(pr, "frac_z2", slider=True)
+        zb.label(text="Z2 se lleva el %d%% de arriba del tubo; Z1 el resto"
+                      % int(round(pr.frac_z2 * 100)))
         zb.prop(pr, "zonas_avanzado", toggle=True)
         if pr.zonas_avanzado:
             col = zb.column(align=True)
             col.prop(pr, "nodos_z1")
             col.prop(pr, "nodos_z2")
-        zb.label(text="Anillos totales: %d" % (pr.n_z1 + 1 + pr.n_z2 + pr.n_z3),
-                 icon='MESH_GRID')
+
+        # ---- casquete inferior ----
+        cb = box.box()
+        cb.label(text="Sellado inferior", icon='SPHERE')
+        cb.prop(pr, "sellar_base")
+        col = cb.column(align=True)
+        col.enabled = pr.sellar_base
+        col.prop(pr, "n_cap")
+        col.prop(pr, "frac_cap_z", slider=True)
+
+        n_cap = pr.n_cap if pr.sellar_base else 0
+        box.label(text="Anillos totales: %d" % (n_cap + pr.n_z1 + 1 + pr.n_z2 + pr.n_z3),
+                  icon='MESH_GRID')
 
         col = box.column(align=True)
-        col.prop(pr, "sellar_base"); col.prop(pr, "orient_esferico"); col.prop(pr, "rotacion_z")
+        col.prop(pr, "orient_esferico"); col.prop(pr, "rotacion_z")
         box.operator("retopologia.generate", icon='MESH_CYLINDER')
 
 
