@@ -57,16 +57,22 @@ class Config:
     N_NODOS_SECCION: int = 10      # nodos internos del spline por sección
 
     # --- Zonas longitudinales (TRES splines en Z) ---
-    # Z1: casquete inferior   Z2: cuerpo   Z3: transición a la cresta
-    N_Z1: int | None     = 12      # anillos en Z1 (None -> N_SLICES)
-    N_Z2: int | None     = 18      # anillos en Z2 (None -> max(4, N_SLICES//3))
+    # De abajo hacia arriba:
+    #   Z1: cuerpo        (tubo, desde donde termina el casquete)
+    #   Z2: intermedia    (franja entre el cuerpo y la cresta)
+    #   Z3: cresta        (transición que aterriza sobre la cresta)
+    N_Z1: int | None     = 20      # anillos en Z1 (None -> N_SLICES)
+    N_Z2: int | None     = 10      # anillos en Z2 (None -> max(4, N_SLICES//3))
     N_Z3: int | None     = 10      # anillos en Z3 (None -> max(4, N_SLICES//3))
-    FRAC_Z1: float       = 0.30    # fracción de (z_crest_start - z_bottom) que ocupa Z1
-    NODOS_Z1: int        = 4       # nodos internos del spline en Z de la zona 1
-    NODOS_Z2: int        = 6       # nodos internos del spline en Z de la zona 2
+    FRAC_Z2: float       = 0.25    # franja superior del tubo que ocupa Z2 (el resto es Z1)
+    NODOS_Z1: int        = 6       # nodos internos del spline en Z del cuerpo
+    NODOS_Z2: int        = 4       # nodos internos del spline en Z de la intermedia
     N_MUESTRAS_Z: int | None = None  # anillos medidos por rebanado (None -> auto)
 
-    SELLAR_BASE: bool    = True    # cerrar la base con un ápice en el punto mínimo
+    # --- Sellado inferior: casquete esférico ---
+    SELLAR_BASE: bool    = True    # cerrar el fondo con un casquete + ápice
+    N_CAP: int           = 6       # anillos del casquete entre el ápice y el cuerpo
+    FRAC_CAP_Z: float    = 0.15    # fracción del tramo base->cresta que ocupa el casquete
 
     # --- Punto base (extremo inferior del muñón, elegido por el usuario) ---
     PUNTO_BASE: object = None            # np.array (3,) en el mismo espacio que 'puntos'
@@ -362,6 +368,8 @@ class Mesh:
         self.CX = self.CY = None
         self.rows1 = None
         self.rows2 = None
+        self.rows_cap = None
+        self.apice_base = None
         self.malla = None
         self.vertices = None
         self.caras = None
@@ -455,7 +463,7 @@ class Mesh:
                 out[:, j, c] = spl(z_ev)
         return out
 
-    # --- Zonas 1 y 2: casquete inferior y cuerpo, un spline en Z cada una ---
+    # --- Zonas 1 y 2: cuerpo e intermedia, un spline en Z cada una ---
     def _part1(self):
         cfg = self.p.cfg
         pr = self.p.puntos_rot
@@ -470,20 +478,27 @@ class Mesh:
             z_bottom = float(np.percentile(pr[:, 2], 1))
 
         z_crest_start = float(env_suave[:, 2].min())
+        span = z_crest_start - z_bottom
         self.z_bottom, self.z_crest_start = z_bottom, z_crest_start
         self.z_crest_top = float(env_suave[:, 2].max())
-        print(f"z_bottom={z_bottom:.2f}  z_crest_start={z_crest_start:.2f}  "
-              f"z_crest_top={self.z_crest_top:.2f}")
+
+        # El casquete se lleva la parte de abajo; el cuerpo arranca donde termina.
+        frac_cap = float(np.clip(cfg.FRAC_CAP_Z, 0.0, 0.6)) if cfg.SELLAR_BASE else 0.0
+        z_body = z_bottom + frac_cap * span
+
+        # Z2 es la franja de arriba, pegada a la cresta. Z1 es todo lo de abajo.
+        frac2 = float(np.clip(cfg.FRAC_Z2, 0.05, 0.95))
+        z_split = z_crest_start - frac2 * (z_crest_start - z_body)
+        self.z_body_start, self.z_split = z_body, z_split
+        print(f"z_bottom={z_bottom:.2f}  z_body={z_body:.2f}  z_split={z_split:.2f}  "
+              f"z_crest_start={z_crest_start:.2f}  z_crest_top={self.z_crest_top:.2f}")
 
         n_z1, n_z2 = cfg.n_z1(), cfg.n_z2()
-        frac = float(np.clip(cfg.FRAC_Z1, 0.05, 0.95))
-        z_split = z_bottom + frac * (z_crest_start - z_bottom)
-        self.z_split = z_split
 
-        # Se mide una sola vez toda la zona tubular; luego cada zona ajusta su
+        # Se mide una sola vez todo el tramo tubular; luego cada zona ajusta su
         # propio spline sobre los anillos que le tocan.
         n_muestras = cfg.N_MUESTRAS_Z or max(cfg.N_SLICES, n_z1 + n_z2)
-        rows_m, zs_m = self._medir_anillos(z_bottom, z_crest_start, n_muestras)
+        rows_m, zs_m = self._medir_anillos(z_body, z_crest_start, n_muestras)
         if len(rows_m) < 4:
             raise ValueError(
                 "Muy pocos anillos medidos (%d). Baja '# nodos splines' o revisa "
@@ -495,7 +510,7 @@ class Mesh:
         sel1 = slice(0, min(len(zs_m), max(4, i_split + 2)))
         sel2 = slice(max(0, min(i_split - 2, len(zs_m) - 4)), len(zs_m))
 
-        niv1 = np.linspace(z_bottom, z_split, n_z1 + 1)
+        niv1 = np.linspace(z_body, z_split, n_z1 + 1)
         niv2 = np.linspace(z_split, z_crest_start, n_z2 + 1)
 
         r1 = self._spline_z(rows_m[sel1], zs_m[sel1], niv1, cfg.NODOS_Z1)
@@ -506,8 +521,55 @@ class Mesh:
         frontera = 0.5 * (r1[-1] + r2[0])
         self.rows_z1, self.rows_z2 = r1[:-1], r2[1:]
         self.rows1 = np.vstack([r1[:-1], frontera[None, :, :], r2[1:]])
-        print(f"Zona 1: {self.rows_z1.shape} | Zona 2: {self.rows_z2.shape} "
-              f"| z_split={z_split:.2f} | anillos medidos={len(rows_m)}")
+        print(f"Z1 cuerpo: {self.rows_z1.shape} | Z2 intermedia: {self.rows_z2.shape} "
+              f"| anillos medidos={len(rows_m)}")
+
+    # --- Casquete esférico inferior ---
+    def _cap(self):
+        """Cierra el fondo con un casquete: anillos entre el ápice y el primer
+        anillo del cuerpo, siguiendo un cuarto de elipsoide.
+
+        El semieje vertical es la distancia del ápice al primer anillo y el
+        horizontal es el propio radio de ese anillo, columna por columna. Así el
+        domo hereda la forma no circular de la sección en vez de ser una esfera
+        perfecta, y empalma exactamente con rows1[0].
+        """
+        cfg = self.p.cfg
+        pr = self.p.puntos_rot
+
+        pb = getattr(self.p, "punto_base_rot", None)
+        if pb is not None and cfg.USAR_BASE_APICE:
+            apice = np.asarray(pb, float)[:3].astype(float).copy()
+        else:
+            apice = pr[np.argmin(pr[:, 2])][:3].astype(float).copy()
+        self.apice_base = apice
+
+        if not cfg.SELLAR_BASE:
+            self.rows_cap = np.empty((0, cfg.N_CIRC, 3))
+            return
+
+        anillo0 = self.rows1[0]
+        c0 = anillo0[:, :2].mean(axis=0)
+
+        # el ápice tiene que quedar por debajo del primer anillo
+        if apice[2] >= anillo0[:, 2].min() - 1e-9:
+            apice[2] = float(anillo0[:, 2].min() - 0.05 * max(1e-6, self.z_crest_start - self.z_bottom))
+            self.apice_base = apice
+            print("Ápice reubicado: quedaba por encima del primer anillo del cuerpo.")
+
+        n_cap = max(1, int(cfg.N_CAP))
+        rows = []
+        for i in range(n_cap):
+            t = (i + 1) / (n_cap + 1)          # 0 = ápice, 1 = primer anillo
+            phi = 0.5 * np.pi * t
+            s, cph = np.sin(phi), np.cos(phi)
+            centro = apice[:2] + (c0 - apice[:2]) * s
+            xy = centro + (anillo0[:, :2] - c0) * s
+            z = apice[2] + (anillo0[:, 2] - apice[2]) * (1.0 - cph)
+            rows.append(np.column_stack([xy, z]))
+        self.rows_cap = np.array(rows)
+        print(f"Casquete: {self.rows_cap.shape} | ápice z={apice[2]:.2f} "
+              f"| altura del domo={anillo0[:, 2].mean() - apice[2]:.2f}")
 
     # --- Zona 3: transición alineada a la cresta ---
     def _part2(self):
@@ -525,7 +587,11 @@ class Mesh:
     # --- ensamblar malla + caras ---
     def _assemble(self):
         cfg = self.p.cfg
-        self.malla = np.vstack([self.rows1, self.rows2])
+        partes = []
+        if self.rows_cap is not None and len(self.rows_cap):
+            partes.append(self.rows_cap)
+        partes += [self.rows1, self.rows2]
+        self.malla = np.vstack(partes)
         self.vertices = self.malla.reshape(-1, 3)
         self.caras = list(construir_caras_quad(len(self.malla), cfg.N_CIRC, cerrado_angular=True))
         if cfg.SELLAR_BASE:
@@ -533,15 +599,10 @@ class Mesh:
         print("malla:", self.malla.shape, "| vértices:", len(self.vertices),
               "| caras:", len(self.caras))
 
-    # --- sellar la base en el punto mínimo real de la nube ---
+    # --- sellar la punta del casquete con un abanico contra el primer anillo ---
     def seal_base(self):
         cfg = self.p.cfg
-        pr = self.p.puntos_rot
-        pb = getattr(self.p, "punto_base_rot", None)
-        if pb is not None and cfg.USAR_BASE_APICE:
-            apice = np.asarray(pb, float)[:3]
-        else:
-            apice = pr[np.argmin(pr[:, 2])][:3]
+        apice = np.asarray(self.apice_base, float)[:3]
         idx_apice = len(self.vertices)
         self.vertices = np.vstack([self.vertices, apice])
         tapa = [[idx_apice, j, (j + 1) % cfg.N_CIRC] for j in range(cfg.N_CIRC)]
@@ -552,6 +613,7 @@ class Mesh:
     def build(self, ifshow=None):
         self._setup()
         self._part1()
+        self._cap()
         self._part2()
         self._assemble()
         if self._want_show(ifshow):
